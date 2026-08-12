@@ -1,0 +1,3 @@
+# 轻量依赖：只用手动标注（加载 .pt 模型做辅助标注需要 requirements-full.txt）
+flask>=2.0
+pillow>=7.2

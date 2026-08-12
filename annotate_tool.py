@@ -1,0 +1,1140 @@
+# -*- coding: utf-8 -*-
+"""
+YOLO 图片标注工具 (本地版) + 模型辅助标注
+==========================================
+- 现代深色界面, 左侧文件列表 (显示已标注/未标注状态)
+- 鼠标拖拽画框 / 选中 / 缩放 / 删除 / 改类别
+- 保存为 YOLO 格式 (class cx cy w h, 归一化)
+- 可加载 YOLO 模型 (.pt) 进行自动预测辅助标注
+- 模型含多个类别时,可勾选只标注其中一部分类别
+- 自定义类别
+
+依赖: flask, pillow, ultralytics (均已安装)
+启动: 双击 start.bat 或运行 python annotate_tool.py
+"""
+import os
+import re
+import sys
+import json
+import math
+import socket
+import subprocess
+import threading
+import webbrowser
+from pathlib import Path
+from flask import Flask, request, jsonify, send_file, Response
+from PIL import Image
+
+PORT = 5000
+
+
+def _port_in_use(port):
+    """端口是否已经有人在监听 (127.0.0.1)。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
+
+
+def _pids_listening_on(port):
+    """返回正在 LISTENING 该端口的 PID 列表 (仅 Windows netstat)。"""
+    pids = set()
+    try:
+        out = subprocess.check_output(["netstat", "-ano"], text=True,
+                                      errors="ignore")
+    except Exception:
+        return []
+    for line in out.splitlines():
+        if "LISTENING" not in line:
+            continue
+        if f":{port} " not in line and not re.search(rf":{port}\b", line):
+            continue
+        m = re.search(r"(\d+)\s*$", line.strip())
+        if m:
+            pids.add(int(m.group(1)))
+    return list(pids)
+
+
+def _pid_commandline(pid):
+    """尽量拿到进程命令行(小写);失败返回空字符串。"""
+    try:
+        out = subprocess.check_output(
+            ["wmic", "process", "where", f"ProcessId={pid}",
+             "get", "CommandLine", "/format:list"],
+            text=True, errors="ignore", timeout=5)
+        return out.lower()
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+            text=True, errors="ignore", timeout=5)
+        return out.lower()
+    except Exception:
+        return ""
+
+
+def free_port_if_stale(port):
+    """启动前:若端口被旧实例(僵死或正常)占用,清掉它,保证本次是全新实例。
+    只杀“命令行里包含 annotate_tool”的 python 进程,避免误伤其它服务。
+    返回 True 表示端口现在可用。"""
+    if not _port_in_use(port) and not _pids_listening_on(port):
+        return True
+    pids = _pids_listening_on(port)
+    if not pids:
+        # 端口像被占用但查不到监听 PID(多为 TIME_WAIT 残留),直接放行
+        return True
+    for pid in pids:
+        if pid == os.getpid():
+            continue
+        try:
+            info = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True, errors="ignore").lower()
+        except Exception:
+            info = ""
+        if "python" not in info:
+            print(f"  [警告] 端口 {port} 被非 python 进程(PID {pid})占用,"
+                  f"未自动清理。请手动关闭它后重试。")
+            return False
+        cmd = _pid_commandline(pid)
+        if "annotate_tool" not in cmd:
+            print(f"  [警告] 端口 {port} 的 python 进程(PID {pid})不是本工具"
+                  f"({cmd.strip()[:80] or '无法读取命令行'}),未自动清理。")
+            return False
+        print(f"  检测到旧的标注工具实例(PID {pid})仍占用端口 {port},正在关闭它...")
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       capture_output=True)
+    # 等端口真正释放
+    for _ in range(20):
+        if not _port_in_use(port):
+            break
+        threading.Event().wait(0.25)
+    print("  旧实例已清理,启动全新实例。")
+    return True
+
+app = Flask(__name__)
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "annotate_config.json")
+
+STATE = {
+    "img_dir": None,
+    "label_dir": None,
+    "images": [],
+    "classes": [],
+    "model": None,
+    "model_path": None,
+}
+
+
+def list_images(folder):
+    p = Path(folder)
+    if not p.exists():
+        return []
+    return sorted([f.name for f in p.iterdir() if f.suffix.lower() in IMG_EXTS])
+
+
+def label_path_for(name):
+    return os.path.join(STATE["label_dir"], Path(name).stem + ".txt")
+
+
+def has_label(name):
+    lp = label_path_for(name)
+    if not os.path.isfile(lp):
+        return False
+    try:
+        return os.path.getsize(lp) > 0
+    except OSError:
+        return False
+
+
+def load_config():
+    if os.path.isfile(CONFIG_FILE):
+        try:
+            return json.load(open(CONFIG_FILE, "r", encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    try:
+        json.dump(cfg, open(CONFIG_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+@app.route("/")
+def index():
+    return Response(HTML_PAGE, mimetype="text/html")
+
+
+@app.route("/api/config")
+def api_config():
+    return jsonify(load_config())
+
+
+@app.route("/api/open", methods=["POST"])
+def api_open():
+    data = request.get_json()
+    img_dir = data.get("img_dir", "").strip().strip('"')
+    label_dir = data.get("label_dir", "").strip().strip('"')
+    classes = data.get("classes", [])
+
+    if not img_dir or not os.path.isdir(img_dir):
+        return jsonify({"ok": False, "msg": f"图片文件夹不存在: {img_dir}"})
+    if not label_dir:
+        label_dir = img_dir
+    os.makedirs(label_dir, exist_ok=True)
+
+    imgs = list_images(img_dir)
+    if not imgs:
+        return jsonify({"ok": False, "msg": "该文件夹内没有图片"})
+
+    STATE["img_dir"] = img_dir
+    STATE["label_dir"] = label_dir
+    STATE["images"] = imgs
+    STATE["classes"] = classes if classes else STATE["classes"]
+
+    cfg = load_config()
+    cfg.update({"img_dir": img_dir, "label_dir": label_dir,
+                "classes": ",".join(STATE["classes"])})
+    save_config(cfg)
+
+    file_status = [{"name": n, "done": has_label(n)} for n in imgs]
+    return jsonify({"ok": True, "count": len(imgs), "img_dir": img_dir,
+                    "classes": STATE["classes"], "files": file_status})
+
+
+@app.route("/api/load_model", methods=["POST"])
+def api_load_model():
+    data = request.get_json()
+    model_path = data.get("model_path", "").strip().strip('"')
+    if not model_path or not os.path.isfile(model_path):
+        return jsonify({"ok": False, "msg": f"模型文件不存在: {model_path}"})
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        return jsonify({"ok": False,
+                        "msg": "未安装模型辅助依赖 ultralytics。请先执行: "
+                                "pip install -r requirements-full.txt"})
+    try:
+        STATE["model"] = YOLO(model_path)
+        STATE["model_path"] = model_path
+        names = STATE["model"].names
+        if isinstance(names, dict):
+            model_classes = [names[i] for i in sorted(names.keys())]
+        else:
+            model_classes = list(names)
+        cfg = load_config()
+        cfg["model_path"] = model_path
+        save_config(cfg)
+        return jsonify({"ok": True, "model_classes": model_classes})
+    except Exception as e:
+        return jsonify({"ok": False, "msg": f"加载失败: {e}"})
+
+
+@app.route("/api/image/<int:idx>")
+def api_image(idx):
+    if idx < 0 or idx >= len(STATE["images"]):
+        return "", 404
+    return send_file(os.path.join(STATE["img_dir"], STATE["images"][idx]))
+
+
+@app.route("/api/meta/<int:idx>")
+def api_meta(idx):
+    if idx < 0 or idx >= len(STATE["images"]):
+        return jsonify({"ok": False})
+    name = STATE["images"][idx]
+    path = os.path.join(STATE["img_dir"], name)
+    with Image.open(path) as im:
+        w, h = im.size
+    boxes = []
+    lp = label_path_for(name)
+    if os.path.isfile(lp):
+        for line in open(lp, "r", encoding="utf-8", errors="ignore"):
+            line = line.strip()
+            if not line:
+                continue
+            p = line.split()
+            if len(p) < 5:
+                continue
+            boxes.append({"cls": int(float(p[0])),
+                          "cx": float(p[1]), "cy": float(p[2]),
+                          "w": float(p[3]), "h": float(p[4])})
+    return jsonify({"ok": True, "name": name, "width": w, "height": h,
+                    "boxes": boxes, "total": len(STATE["images"]), "idx": idx})
+
+
+@app.route("/api/save/<int:idx>", methods=["POST"])
+def api_save(idx):
+    if idx < 0 or idx >= len(STATE["images"]):
+        return jsonify({"ok": False})
+    boxes = request.get_json().get("boxes", [])
+    name = STATE["images"][idx]
+    lp = label_path_for(name)
+    n_cls = len(STATE["classes"])
+    lines = []
+    errors = []
+    for i, b in enumerate(boxes, 1):
+        try:
+            cls = int(b["cls"])
+            cx = float(b["cx"])
+            cy = float(b["cy"])
+            w = float(b["w"])
+            h = float(b["h"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"第{i}个框字段缺失或不是数字")
+            continue
+        errs = []
+        if n_cls and (cls < 0 or cls >= n_cls):
+            errs.append(f"类别 {cls} 超出范围 (0~{n_cls - 1})")
+        for k, v in (("cx", cx), ("cy", cy), ("w", w), ("h", h)):
+            if not math.isfinite(v) or not (0 <= v <= 1):
+                errs.append(f"{k}={v} 越界 (应为 0~1)")
+        if w <= 0 or h <= 0:
+            errs.append("宽高必须大于 0")
+        if errs:
+            errors.append(f"第{i}个框: " + "; ".join(errs))
+            continue
+        lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    if errors:
+        shown = errors[:10]
+        msg = "；".join(shown) + ("…" if len(errors) > 10 else "")
+        return jsonify({"ok": False, "msg": msg, "errors": errors})
+    with open(lp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        if lines:
+            f.write("\n")
+    return jsonify({"ok": True, "count": len(lines), "done": len(lines) > 0})
+
+
+def _parse_only_cls(raw):
+    """解析前端传来的模型类别过滤列表。
+    None = 不过滤(保留全部类别)；[] = 全部过滤(不输出任何框)。"""
+    if raw is None:
+        return None
+    if isinstance(raw, (str, int, float)):
+        raw = [raw]
+    try:
+        return set(int(x) for x in raw)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route("/api/predict/<int:idx>", methods=["POST"])
+def api_predict(idx):
+    if STATE["model"] is None:
+        return jsonify({"ok": False, "msg": "未加载模型"})
+    if idx < 0 or idx >= len(STATE["images"]):
+        return jsonify({"ok": False})
+    data = request.get_json() or {}
+    conf = float(data.get("conf", 0.25))
+    cls_offset = int(data.get("cls_offset", 0))
+    only_cls = _parse_only_cls(data.get("only_cls"))
+    path = os.path.join(STATE["img_dir"], STATE["images"][idx])
+    res = STATE["model"].predict(path, conf=conf, verbose=False)[0]
+    boxes = []
+    if res.boxes is not None:
+        for b in res.boxes:
+            model_cls = int(b.cls[0])
+            if only_cls is not None and model_cls not in only_cls:
+                continue
+            xc, yc, ww, hh = b.xywhn[0].tolist()
+            boxes.append({"cls": model_cls + cls_offset,
+                          "cx": xc, "cy": yc, "w": ww, "h": hh})
+    return jsonify({"ok": True, "boxes": boxes})
+
+
+@app.route("/api/split", methods=["POST"])
+def api_split():
+    """把当前 img_dir / label_dir 里的图片+标签随机划分到
+    输出目录下的 images/train,val 和 labels/train,val。
+    可选 also 生成 data.yaml。"""
+    import random
+    import shutil
+    data = request.get_json() or {}
+    out_dir = data.get("out_dir", "").strip().strip('"')
+    val_ratio = float(data.get("val_ratio", 0.2))
+    seed = int(data.get("seed", 0))
+    move = bool(data.get("move", False))          # True=移动, False=复制
+    write_yaml = bool(data.get("write_yaml", True))
+
+    if not STATE["img_dir"]:
+        return jsonify({"ok": False, "msg": "请先打开图片文件夹"})
+    if not out_dir:
+        return jsonify({"ok": False, "msg": "请填写输出目录"})
+    if val_ratio <= 0 or val_ratio >= 1:
+        return jsonify({"ok": False, "msg": "验证集比例应在 0~1 之间"})
+
+    imgs = list_images(STATE["img_dir"])
+    if not imgs:
+        return jsonify({"ok": False, "msg": "没有可划分的图片"})
+
+    # 建目录
+    dirs = {}
+    for sub in ["images/train", "images/val", "labels/train", "labels/val"]:
+        d = os.path.join(out_dir, *sub.split("/"))
+        os.makedirs(d, exist_ok=True)
+        dirs[sub] = d
+
+    random.seed(seed)
+    shuffled = imgs[:]
+    random.shuffle(shuffled)
+    n_val = max(1, int(len(shuffled) * val_ratio))
+    val_set = set(shuffled[:n_val])
+
+    op = shutil.move if move else shutil.copy2
+    counts = {"train": 0, "val": 0, "train_empty": 0, "val_empty": 0}
+
+    for name in imgs:
+        split = "val" if name in val_set else "train"
+        # 图片
+        src_img = os.path.join(STATE["img_dir"], name)
+        op(src_img, os.path.join(dirs[f"images/{split}"], name))
+        # 标签 (没有则生成空 txt, 作为负样本)
+        stem = Path(name).stem
+        src_lbl = os.path.join(STATE["label_dir"], stem + ".txt")
+        dst_lbl = os.path.join(dirs[f"labels/{split}"], stem + ".txt")
+        if os.path.isfile(src_lbl):
+            op(src_lbl, dst_lbl)
+            if os.path.getsize(dst_lbl) == 0:
+                counts[f"{split}_empty"] += 1
+        else:
+            open(dst_lbl, "w").close()
+            counts[f"{split}_empty"] += 1
+        counts[split] += 1
+
+    yaml_path = None
+    if write_yaml:
+        classes = STATE["classes"]
+        yaml_path = os.path.join(out_dir, "data.yaml")
+        lines = [
+            f"path: {out_dir.replace(os.sep, '/')}",
+            "train: images/train",
+            "val: images/val",
+            "",
+            f"nc: {len(classes)}",
+            "names:",
+        ]
+        for i, c in enumerate(classes):
+            lines.append(f"  {i}: {c}")
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    return jsonify({"ok": True, "counts": counts, "out_dir": out_dir,
+                    "yaml": yaml_path, "moved": move})
+
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>YOLO 标注工具</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212b; --border:#2a2f3a;
+    --txt:#e4e7ee; --muted:#8b93a4; --accent:#3b82f6; --accent2:#2563eb;
+    --green:#22c55e; --red:#ef4444;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt);overflow:hidden;}
+  button{font-family:inherit;cursor:pointer;border:none;border-radius:8px;transition:.15s;}
+  input[type=text],input[type=number]{background:var(--bg);color:var(--txt);border:1px solid var(--border);padding:8px 10px;border-radius:8px;font-size:13px;outline:none;}
+  input:focus{border-color:var(--accent);}
+
+  /* 顶栏 */
+  #topbar{height:52px;display:flex;align-items:center;gap:8px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--border);}
+  #topbar .logo{font-weight:700;font-size:15px;margin-right:6px;display:flex;align-items:center;gap:8px;}
+  #topbar .logo .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);}
+  .tbtn{background:var(--panel2);color:var(--txt);padding:8px 14px;font-size:13px;display:flex;align-items:center;gap:6px;}
+  .tbtn:hover{background:#2a3140;}
+  .tbtn.primary{background:var(--accent);} .tbtn.primary:hover{background:var(--accent2);}
+  .tbtn.green{background:var(--green);} .tbtn.green:hover{filter:brightness(1.1);}
+  .tbtn:disabled{opacity:.4;cursor:not-allowed;}
+  #navInfo{font-size:13px;color:var(--muted);min-width:160px;text-align:center;}
+  .spacer{flex:1;}
+
+  /* 布局 */
+  #layout{display:flex;height:calc(100vh - 52px);}
+  #filePanel{width:230px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;}
+  #filePanel .hd{padding:10px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;}
+  #fileList{flex:1;overflow-y:auto;}
+  .fitem{padding:7px 12px;font-size:12px;display:flex;align-items:center;gap:8px;cursor:pointer;border-bottom:1px solid #1b1f28;white-space:nowrap;overflow:hidden;}
+  .fitem:hover{background:var(--panel2);}
+  .fitem.active{background:#243049;}
+  .fitem .badge{width:8px;height:8px;border-radius:50%;flex-shrink:0;background:#4b5563;}
+  .fitem.done .badge{background:var(--green);}
+  .fitem .nm{overflow:hidden;text-overflow:ellipsis;}
+
+  #center{flex:1;display:flex;flex-direction:column;background:#0a0c10;}
+  #canvasWrap{flex:1;overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;}
+  canvas{cursor:crosshair;box-shadow:0 4px 30px rgba(0,0,0,.6);}
+  #zoomHint{position:absolute;bottom:10px;left:12px;font-size:11px;color:var(--muted);background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px;}
+
+  #rightPanel{width:240px;background:var(--panel);border-left:1px solid var(--border);display:flex;flex-direction:column;}
+  .section{padding:12px;border-bottom:1px solid var(--border);}
+  .section h4{margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;}
+  .cls-btn{display:flex;align-items:center;gap:8px;width:100%;text-align:left;margin:4px 0;padding:8px 10px;background:var(--panel2);color:var(--txt);font-size:13px;}
+  .cls-btn:hover{background:#2a3140;}
+  .cls-btn.active{outline:2px solid #fff;}
+  .cls-btn .sw{width:14px;height:14px;border-radius:4px;flex-shrink:0;}
+  .cls-btn .key{margin-left:auto;font-size:11px;color:var(--muted);background:#0d0f14;padding:1px 6px;border-radius:4px;}
+  #boxList{max-height:240px;overflow-y:auto;}
+  .box-item{display:flex;align-items:center;gap:6px;padding:6px;margin:3px 0;background:var(--panel2);border-radius:6px;font-size:12px;}
+  .box-item.sel{outline:2px solid #fff;}
+  .box-item select{flex:1;background:var(--bg);color:var(--txt);border:1px solid var(--border);border-radius:5px;padding:3px;}
+  .box-item .del{color:var(--red);cursor:pointer;padding:0 4px;font-weight:700;}
+
+  /* 状态条 */
+  #statusbar{height:26px;background:var(--accent2);display:flex;align-items:center;padding:0 12px;font-size:12px;gap:16px;}
+  #statusbar .prog{margin-left:auto;}
+
+  /* 弹窗 */
+  #modalMask{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:100;}
+  .modal{width:560px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.5);}
+  .modal h2{margin:0 0 4px;font-size:18px;}
+  .modal .sub{color:var(--muted);font-size:12px;margin-bottom:18px;}
+  .modal .field{margin:12px 0;}
+  .modal label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px;}
+  .modal input{width:100%;}
+  .modal .hint{font-size:11px;color:var(--muted);margin-top:4px;}
+  .modal .actions{margin-top:20px;display:flex;gap:10px;justify-content:flex-end;}
+  .grp{border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:14px;}
+  .grp .gt{font-size:12px;color:var(--accent);margin-bottom:8px;font-weight:600;}
+  .inline{display:flex;gap:10px;} .inline>div{flex:1;}
+  #modelMsg{font-size:11px;margin-top:6px;}
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--muted)">v0.3</span></div>
+  <span id="curFolder" style="font-size:12px;color:var(--muted);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
+  <button class="tbtn" onclick="openModal()">⚙ 配置</button>
+  <button class="tbtn" id="btnSplit" onclick="openSplit()" disabled>📂 划分数据集</button>
+  <div class="spacer"></div>
+  <button class="tbtn" id="btnPrev" onclick="go(-1)" disabled>◀ 上一张</button>
+  <span id="navInfo">未打开文件夹</span>
+  <button class="tbtn" id="btnNext" onclick="go(1)" disabled>下一张 ▶</button>
+  <div class="spacer"></div>
+  <button class="tbtn green" id="btnPredict" onclick="predict()" disabled>✨ 模型预测</button>
+  <button class="tbtn" id="btnClear" onclick="clearBoxes()" disabled>清空</button>
+  <button class="tbtn primary" id="btnSave" onclick="saveLabels()" disabled>💾 保存</button>
+</div>
+
+<div id="layout">
+  <div id="filePanel">
+    <div class="hd"><span>文件列表</span><span id="fileCount">0</span></div>
+    <div id="fileList"></div>
+  </div>
+
+  <div id="center">
+    <div id="canvasWrap">
+      <canvas id="cv"></canvas>
+      <div id="zoomHint">滚轮缩放 · 拖拽画框 · 右键拖动平移</div>
+    </div>
+  </div>
+
+  <div id="rightPanel">
+    <div class="section">
+      <h4>类别 (画框时使用)</h4>
+      <div id="clsBtns"></div>
+    </div>
+    <div class="section" style="flex:1;overflow:hidden;display:flex;flex-direction:column;">
+      <h4>本图标注框 (<span id="boxCount">0</span>)</h4>
+      <div id="boxList"></div>
+    </div>
+  </div>
+</div>
+
+<div id="statusbar">
+  <span id="dirtyTag" style="display:none;color:#f59e0b;">● 未保存</span>
+  <span id="statusText">就绪</span>
+  <span class="prog" id="progText"></span>
+</div>
+
+<!-- 配置弹窗 -->
+<div id="modalMask">
+  <div class="modal">
+    <h2>配置</h2>
+    <div class="sub">设置图片目录、类别，以及可选的辅助标注模型</div>
+
+    <div class="grp">
+      <div class="gt">① 数据</div>
+      <div class="field">
+        <label>图片文件夹路径</label>
+        <input id="imgDir" type="text" placeholder="如 F:\data\images\train">
+      </div>
+      <div class="field">
+        <label>标签文件夹路径 (留空 = 与图片同目录)</label>
+        <input id="labelDir" type="text" placeholder="如 F:\data\labels\train">
+      </div>
+      <div class="field">
+        <label>类别 (英文，逗号分隔，顺序即为类别ID)</label>
+        <input id="classesIn" type="text" placeholder="如 acetylene_cylinder,oxygen_cylinder">
+        <div class="hint">第1个=0, 第2个=1 ... 建议用英文，避免训练时中文路径问题</div>
+      </div>
+    </div>
+
+    <div class="grp">
+      <div class="gt">② 模型辅助标注 (可选)</div>
+      <div class="field">
+        <label>模型权重路径 (.pt)</label>
+        <input id="modelPath" type="text" placeholder="如 ...\weights\best.pt">
+      </div>
+      <div class="inline">
+        <div class="field">
+          <label>类别偏移</label>
+          <input id="clsOffset" type="number" value="0">
+        </div>
+        <div class="field">
+          <label>置信度阈值</label>
+          <input id="confIn" type="number" step="0.05" value="0.25">
+        </div>
+      </div>
+      <div class="hint">模型类别ID + 偏移 = 标注类别ID。例：模型 helmet=0,no-helmet=1 对应标注 0/1，偏移填 0</div>
+      <button class="tbtn" style="margin-top:8px" onclick="loadModel()">加载模型</button>
+      <div id="modelMsg"></div>
+      <div class="field" id="modelClsBox" style="display:none">
+        <label>只标注以下模型类别</label>
+        <div id="modelClsList" style="max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:6px;"></div>
+        <div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <button class="tbtn" style="padding:4px 10px;font-size:11px" onclick="setModelClsAll(true)">全选</button>
+          <button class="tbtn" style="padding:4px 10px;font-size:11px" onclick="setModelClsAll(false)">全不选</button>
+          <span class="hint">未勾选的类别，预测时会被过滤掉；全部不勾选 = 不输出任何框</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="tbtn" onclick="closeModal()">取消</button>
+      <button class="tbtn primary" onclick="openFolder()">打开文件夹</button>
+    </div>
+  </div>
+</div>
+
+<!-- 划分数据集弹窗 -->
+<div id="splitMask" style="position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:100;">
+  <div class="modal">
+    <h2>划分数据集</h2>
+    <div class="sub">把当前已标注的图片+标签随机分成训练集 / 验证集，并生成标准结构和 data.yaml</div>
+
+    <div class="grp">
+      <div class="gt">划分设置</div>
+      <div class="field">
+        <label>输出目录 (会在此目录下生成 images/ 和 labels/)</label>
+        <input id="splitOut" type="text" placeholder="如 D:\datasets\my_dataset_split">
+      </div>
+      <div class="inline">
+        <div class="field">
+          <label>验证集比例</label>
+          <input id="splitRatio" type="number" step="0.05" min="0.05" max="0.5" value="0.2">
+        </div>
+        <div class="field">
+          <label>随机种子</label>
+          <input id="splitSeed" type="number" value="0">
+        </div>
+      </div>
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="splitMove" type="checkbox" style="width:auto"> 移动文件 (不勾选=复制，保留原图)
+        </label>
+      </div>
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="splitYaml" type="checkbox" style="width:auto" checked> 同时生成 data.yaml
+        </label>
+      </div>
+      <div class="hint">没有标注框的图片会生成空 txt，作为负样本(反例)一并划分。</div>
+    </div>
+
+    <div class="actions">
+      <button class="tbtn" onclick="document.getElementById('splitMask').style.display='none'">取消</button>
+      <button class="tbtn primary" id="splitGo" onclick="doSplit()">开始划分</button>
+    </div>
+    <div id="splitMsg" style="font-size:12px;margin-top:10px"></div>
+  </div>
+</div>
+
+<script>
+let idx=0,total=0,imgW=0,imgH=0,scale=1,baseScale=1,offX=0,offY=0;
+let boxes=[],classes=[],curCls=0,selIdx=-1,files=[];
+let drawing=false,sx=0,sy=0,ex=0,ey=0;
+let panning=false,panX=0,panY=0;
+let modelSelCls=null;
+let dirty=false;
+let undoStack=[],redoStack=[];
+let moving=false,resizing=false,resizeHandle=null;
+let moveStartX=0,moveStartY=0,origBox=null;
+const MAX_UNDO=50;
+const palette=["#ef4444","#22c55e","#3b82f6","#f59e0b","#a855f7","#06b6d4","#ec4899","#84cc16","#f97316","#14b8a6"];
+const cv=document.getElementById('cv'),ctx=cv.getContext('2d');
+const img=new Image();
+
+function st(t){document.getElementById('statusText').textContent=t;}
+function openModal(){document.getElementById('modalMask').style.display='flex';}
+function closeModal(){document.getElementById('modalMask').style.display='none';}
+
+function snap(){
+  undoStack.push(JSON.parse(JSON.stringify(boxes)));
+  if(undoStack.length>MAX_UNDO)undoStack.shift();
+  redoStack=[];
+}
+function undo(){
+  if(!undoStack.length)return;
+  redoStack.push(JSON.parse(JSON.stringify(boxes)));
+  boxes=undoStack.pop();
+  selIdx=Math.min(selIdx,boxes.length-1);
+  dirty=true;redraw();saveLabels(true);
+}
+function redo(){
+  if(!redoStack.length)return;
+  undoStack.push(JSON.parse(JSON.stringify(boxes)));
+  boxes=redoStack.pop();
+  selIdx=Math.min(selIdx,boxes.length-1);
+  dirty=true;redraw();saveLabels(true);
+}
+function markDirty(){
+  dirty=true;
+  const dt=document.getElementById('dirtyTag');
+  if(dt)dt.style.display='inline';
+}
+
+// 载入上次配置
+fetch('/api/config').then(r=>r.json()).then(c=>{
+  if(c.img_dir)document.getElementById('imgDir').value=c.img_dir;
+  if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
+  if(c.classes)document.getElementById('classesIn').value=c.classes;
+  if(c.model_path)document.getElementById('modelPath').value=c.model_path;
+  openModal();
+});
+
+function openFolder(){
+  const img_dir=document.getElementById('imgDir').value;
+  const label_dir=document.getElementById('labelDir').value;
+  classes=document.getElementById('classesIn').value.split(',').map(s=>s.trim()).filter(s=>s);
+  if(!classes.length){alert('请至少填写一个类别');return;}
+  fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({img_dir,label_dir,classes})}).then(r=>r.json()).then(d=>{
+    if(!d.ok){alert(d.msg);return;}
+    total=d.count;idx=0;files=d.files;
+    const cf=document.getElementById('curFolder');
+    if(cf){cf.textContent='📁 '+(d.img_dir||'');cf.title=d.img_dir||'';}
+    closeModal();
+    ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnSplit'].forEach(id=>document.getElementById(id).disabled=false);
+    buildClsBtns();buildFileList();load(0);
+  });
+}
+
+function loadModel(){
+  const model_path=document.getElementById('modelPath').value;
+  const m=document.getElementById('modelMsg');
+  m.style.color='#8b93a4';m.textContent='加载中...';
+  fetch('/api/load_model',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({model_path})}).then(r=>r.json()).then(d=>{
+    if(!d.ok){m.style.color='#ef4444';m.textContent='✗ '+d.msg;return;}
+    m.style.color='#22c55e';m.textContent='✓ 已加载，模型类别: '+d.model_classes.join(', ');
+    buildModelClsSel(d.model_classes);
+  });
+}
+
+function buildModelClsSel(model_classes){
+  const box=document.getElementById('modelClsList');
+  box.innerHTML='';
+  modelSelCls=null;
+  model_classes.forEach((name,i)=>{
+    const lab=document.createElement('label');
+    lab.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;font-size:12px;cursor:pointer;border-radius:6px;';
+    lab.addEventListener('mouseenter',()=>lab.style.background='#2a3140');
+    lab.addEventListener('mouseleave',()=>lab.style.background='transparent');
+    const cb=document.createElement('input');
+    cb.type='checkbox';cb.checked=true;cb.value=i;
+    cb.addEventListener('change',collectModelSel);
+    const span=document.createElement('span');
+    span.textContent=i+': '+name;
+    lab.appendChild(cb);lab.appendChild(span);
+    box.appendChild(lab);
+  });
+  document.getElementById('modelClsBox').style.display='block';
+}
+
+function collectModelSel(){
+  const cbs=document.querySelectorAll('#modelClsList input[type=checkbox]');
+  const sel=[];
+  cbs.forEach(cb=>{if(cb.checked)sel.push(parseInt(cb.value));});
+  modelSelCls=sel;
+}
+
+function setModelClsAll(on){
+  document.querySelectorAll('#modelClsList input[type=checkbox]').forEach(cb=>cb.checked=on);
+  collectModelSel();
+}
+
+function buildClsBtns(){
+  const box=document.getElementById('clsBtns');box.innerHTML='';
+  classes.forEach((c,i)=>{
+    const b=document.createElement('button');
+    b.className='cls-btn'+(i===curCls?' active':'');
+    const sw=document.createElement('span');
+    sw.className='sw';sw.style.background=palette[i%palette.length];
+    const tx=document.createElement('span');
+    tx.textContent=c;
+    b.appendChild(sw);b.appendChild(tx);
+    if(i<10){
+      const key=document.createElement('span');
+      key.className='key';key.textContent=i;
+      b.appendChild(key);
+    }
+    b.onclick=()=>{curCls=i;buildClsBtns();};
+    box.appendChild(b);
+  });
+}
+
+function buildFileList(){
+  const box=document.getElementById('fileList');box.innerHTML='';
+  document.getElementById('fileCount').textContent=total;
+  files.forEach((f,i)=>{
+    const d=document.createElement('div');
+    d.className='fitem'+(i===idx?' active':'')+(f.done?' done':'');
+    const badge=document.createElement('span');
+    badge.className='badge';
+    const nm=document.createElement('span');
+    nm.className='nm';
+    nm.textContent=(i+1)+'. '+f.name;
+    d.appendChild(badge);d.appendChild(nm);
+    d.onclick=()=>{saveLabels(true);load(i);};
+    d.id='f'+i;
+    box.appendChild(d);
+  });
+  updateProg();
+}
+
+function updateProg(){
+  const done=files.filter(f=>f.done).length;
+  document.getElementById('progText').textContent=`已标注 ${done} / ${total}`;
+}
+
+function load(i){
+  if(i<0||i>=total)return;
+  idx=i;selIdx=-1;dirty=false;
+  const dt=document.getElementById('dirtyTag');if(dt)dt.style.display='none';
+  document.querySelectorAll('.fitem').forEach(e=>e.classList.remove('active'));
+  const fi=document.getElementById('f'+i);if(fi){fi.classList.add('active');fi.scrollIntoView({block:'nearest'});}
+  fetch('/api/meta/'+idx).then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    imgW=d.width;imgH=d.height;boxes=d.boxes;
+    document.getElementById('navInfo').textContent=`${idx+1} / ${total}`;
+    st(d.name+'  ('+imgW+'×'+imgH+')');
+    img.onload=()=>{fit();};
+    img.src='/api/image/'+idx+'?t='+Date.now();
+  });
+}
+
+function fit(){
+  const wrap=document.getElementById('canvasWrap');
+  const maxW=wrap.clientWidth-30,maxH=wrap.clientHeight-30;
+  baseScale=Math.min(maxW/imgW,maxH/imgH);
+  scale=baseScale;offX=0;offY=0;
+  applySize();
+}
+function applySize(){
+  cv.width=imgW*scale;cv.height=imgH*scale;
+  cv.style.transform=`translate(${offX}px,${offY}px)`;
+  redraw();
+}
+
+function redraw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(img,0,0,cv.width,cv.height);
+  boxes.forEach((b,i)=>{
+    const x=(b.cx-b.w/2)*cv.width,y=(b.cy-b.h/2)*cv.height,w=b.w*cv.width,h=b.h*cv.height;
+    ctx.lineWidth=(i===selIdx)?3:2;
+    ctx.strokeStyle=palette[b.cls%palette.length];
+    ctx.strokeRect(x,y,w,h);
+    const label=classes[b.cls]||b.cls;
+    ctx.font='13px sans-serif';
+    const tw=ctx.measureText(label).width;
+    ctx.fillStyle=palette[b.cls%palette.length];
+    ctx.fillRect(x,y-17,tw+8,17);
+    ctx.fillStyle='#fff';ctx.fillText(label,x+4,y-4);
+  });
+  if(drawing){ctx.strokeStyle='#fff';ctx.lineWidth=1.5;ctx.setLineDash([5,3]);ctx.strokeRect(sx,sy,ex-sx,ey-sy);ctx.setLineDash([]);}
+  if(selIdx>=0)drawHandles();
+  buildBoxList();
+}
+
+function buildBoxList(){
+  const box=document.getElementById('boxList');box.innerHTML='';
+  document.getElementById('boxCount').textContent=boxes.length;
+  boxes.forEach((b,i)=>{
+    const d=document.createElement('div');d.className='box-item'+(i===selIdx?' sel':'');
+    const sw=document.createElement('span');sw.style.cssText=`width:12px;height:12px;border-radius:3px;background:${palette[b.cls%palette.length]}`;
+    const sel=document.createElement('select');
+    classes.forEach((c,ci)=>{const o=document.createElement('option');o.value=ci;o.text=c;if(ci===b.cls)o.selected=true;sel.appendChild(o);});
+    sel.onchange=()=>{snap();b.cls=parseInt(sel.value);markDirty();redraw();};
+    const del=document.createElement('span');del.className='del';del.textContent='✕';
+    del.onclick=(e)=>{e.stopPropagation();snap();boxes.splice(i,1);selIdx=-1;markDirty();redraw();};
+    d.appendChild(sw);d.appendChild(sel);d.appendChild(del);
+    d.onclick=(e)=>{if(e.target!==del&&e.target!==sel){selIdx=i;redraw();}};
+    box.appendChild(d);
+  });
+}
+
+function getPos(e){const r=cv.getBoundingClientRect();return{x:e.clientX-r.left,y:e.clientY-r.top};}
+
+function drawHandles(){
+  const b=boxes[selIdx];
+  if(!b)return;
+  const x=(b.cx-b.w/2)*cv.width,y=(b.cy-b.h/2)*cv.height,w=b.w*cv.width,h=b.h*cv.height;
+  const H=5;
+  const pts=[[x,y],[x+w/2,y],[x+w,y],[x+w,y+h/2],[x+w,y+h],[x+w/2,y+h],[x,y+h],[x,y+h/2]];
+  ctx.fillStyle='#fff';ctx.strokeStyle='#111';ctx.lineWidth=1;
+  pts.forEach(p=>{ctx.fillRect(p[0]-H,p[1]-H,H*2,H*2);ctx.strokeRect(p[0]-H,p[1]-H,H*2,H*2);});
+}
+
+function handleAt(p){
+  if(selIdx<0)return null;
+  const b=boxes[selIdx];
+  const x=(b.cx-b.w/2)*cv.width,y=(b.cy-b.h/2)*cv.height,w=b.w*cv.width,h=b.h*cv.height;
+  const H=8;
+  const pts={nw:[x,y],n:[x+w/2,y],ne:[x+w,y],e:[x+w,y+h/2],se:[x+w,y+h],s:[x+w/2,y+h],sw:[x,y+h],w:[x,y+h/2]};
+  for(const k in pts){
+    if(Math.abs(p.x-pts[k][0])<=H&&Math.abs(p.y-pts[k][1])<=H)return k;
+  }
+  return null;
+}
+
+function boxAt(p){
+  for(let i=boxes.length-1;i>=0;i--){
+    const b=boxes[i],x=(b.cx-b.w/2)*cv.width,y=(b.cy-b.h/2)*cv.height,w=b.w*cv.width,h=b.h*cv.height;
+    if(p.x>=x&&p.x<=x+w&&p.y>=y&&p.y<=y+h)return i;
+  }
+  return -1;
+}
+
+function doMove(e){
+  const b=boxes[selIdx];
+  if(!b)return;
+  const p=getPos(e);
+  const dx=(p.x-moveStartX)/cv.width,dy=(p.y-moveStartY)/cv.height;
+  const halfW=b.w/2,halfH=b.h/2;
+  b.cx=Math.max(halfW,Math.min(1-halfW,origBox.cx+dx));
+  b.cy=Math.max(halfH,Math.min(1-halfH,origBox.cy+dy));
+  redraw();
+}
+
+function doResize(e){
+  const b=boxes[selIdx];
+  if(!b)return;
+  const p=getPos(e);
+  let x1=(b.cx-b.w/2)*cv.width,y1=(b.cy-b.h/2)*cv.height;
+  let x2=(b.cx+b.w/2)*cv.width,y2=(b.cy+b.h/2)*cv.height;
+  if(resizeHandle.includes('w'))x1=p.x;
+  if(resizeHandle.includes('e'))x2=p.x;
+  if(resizeHandle.includes('n'))y1=p.y;
+  if(resizeHandle.includes('s'))y2=p.y;
+  let lx=Math.min(x1,x2),rx=Math.max(x1,x2);
+  let ty=Math.min(y1,y2),by=Math.max(y1,y2);
+  lx=Math.max(0,lx);ty=Math.max(0,ty);
+  rx=Math.min(cv.width,rx);by=Math.min(cv.height,by);
+  if(rx-lx<10||by-ty<10)return;
+  b.cx=(lx+rx)/2/cv.width;b.cy=(ty+by)/2/cv.height;
+  b.w=(rx-lx)/cv.width;b.h=(by-ty)/cv.height;
+  redraw();
+}
+
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('mousedown',e=>{
+  if(e.button===2){panning=true;panX=e.clientX-offX;panY=e.clientY-offY;return;}
+  const p=getPos(e);
+  const h=handleAt(p);
+  if(h){
+    resizing=true;resizeHandle=h;
+    const b=boxes[selIdx];
+    snap();markDirty();redraw();
+    return;
+  }
+  const bi=boxAt(p);
+  if(bi>=0){
+    selIdx=bi;
+    moving=true;
+    moveStartX=p.x;moveStartY=p.y;
+    origBox={cx:boxes[bi].cx,cy:boxes[bi].cy};
+    snap();markDirty();redraw();
+    return;
+  }
+  drawing=true;sx=ex=p.x;sy=ey=p.y;
+});
+window.addEventListener('mousemove',e=>{
+  if(panning){offX=e.clientX-panX;offY=e.clientY-panY;cv.style.transform=`translate(${offX}px,${offY}px)`;return;}
+  if(moving){doMove(e);return;}
+  if(resizing){doResize(e);return;}
+  if(!drawing)return;const p=getPos(e);ex=p.x;ey=p.y;redraw();
+});
+window.addEventListener('mouseup',e=>{
+  if(panning){panning=false;return;}
+  if(resizing){resizing=false;saveLabels(true);return;}
+  if(moving){moving=false;saveLabels(true);return;}
+  if(!drawing)return;drawing=false;
+  const x1=Math.min(sx,ex),y1=Math.min(sy,ey),x2=Math.max(sx,ex),y2=Math.max(sy,ey);
+  if(x2-x1<5||y2-y1<5){redraw();return;}
+  snap();
+  boxes.push({cls:curCls,cx:((x1+x2)/2)/cv.width,cy:((y1+y2)/2)/cv.height,w:(x2-x1)/cv.width,h:(y2-y1)/cv.height});
+  selIdx=boxes.length-1;markDirty();redraw();
+});
+cv.addEventListener('dblclick',()=>{if(selIdx>=0){snap();boxes.splice(selIdx,1);selIdx=-1;markDirty();redraw();}});
+document.getElementById('canvasWrap').addEventListener('wheel',e=>{
+  e.preventDefault();
+  const f=e.deltaY<0?1.1:0.9;
+  scale=Math.max(baseScale*0.5,Math.min(baseScale*8,scale*f));
+  applySize();
+},{passive:false});
+
+function go(d){saveLabels(true);load(idx+d);}
+function saveLabels(silent){
+  if(total===0)return;
+  fetch('/api/save/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({boxes})}).then(r=>r.json()).then(d=>{
+    if(d.ok){
+      dirty=false;
+      const dt=document.getElementById('dirtyTag');if(dt)dt.style.display='none';
+      files[idx].done=d.done;const fi=document.getElementById('f'+idx);if(fi)fi.classList.toggle('done',d.done);updateProg();
+      if(!silent)st('✓ 已保存 '+d.count+' 个框');
+    }else{
+      st('✗ 保存失败: '+(d.msg||'未知错误'));
+      const dt=document.getElementById('dirtyTag');if(dt)dt.style.display='inline';
+    }
+  });
+}
+function iou(a,b){
+  const ax1=a.cx-a.w/2,ay1=a.cy-a.h/2,ax2=a.cx+a.w/2,ay2=a.cy+a.h/2;
+  const bx1=b.cx-b.w/2,by1=b.cy-b.h/2,bx2=b.cx+b.w/2,by2=b.cy+b.h/2;
+  const ix1=Math.max(ax1,bx1),iy1=Math.max(ay1,by1),ix2=Math.min(ax2,bx2),iy2=Math.min(ay2,by2);
+  const iw=Math.max(0,ix2-ix1),ih=Math.max(0,iy2-iy1),inter=iw*ih;
+  const union=((ax2-ax1)*(ay2-ay1))+((bx2-bx1)*(by2-by1))-inter;
+  return union>0?inter/union:0;
+}
+function dedupeAppend(newBoxes){
+  const out=[];
+  newBoxes.forEach(nb=>{
+    let dup=false;
+    for(const ob of boxes){if(ob.cls===nb.cls&&iou(ob,nb)>=0.5){dup=true;break;}}
+    if(!dup){for(const ob of out){if(ob.cls===nb.cls&&iou(ob,nb)>=0.5){dup=true;break;}}}
+    if(!dup)out.push(nb);
+  });
+  return out;
+}
+function predict(){
+  const conf=parseFloat(document.getElementById('confIn').value)||0.25;
+  const cls_offset=parseInt(document.getElementById('clsOffset').value)||0;
+  st('模型预测中...');
+  fetch('/api/predict/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({conf,cls_offset,only_cls:modelSelCls})}).then(r=>r.json()).then(d=>{
+    if(!d.ok){st('预测失败: '+(d.msg||''));return;}
+    // 过滤模型可能输出的退化框(宽高<=0/非数字),避免出现"看不见、点不中、存不了"的框
+    const validBoxes=d.boxes.filter(b=>b&&isFinite(b.cx)&&isFinite(b.cy)&&b.w>0&&b.h>0);
+    const badCount=d.boxes.length-validBoxes.length;
+    const added=dedupeAppend(validBoxes);
+    let warn='';
+    if(classes.length){
+      let clsBad=0;
+      added.forEach(b=>{
+        if(b.cls<0||b.cls>=classes.length){
+          clsBad++;
+          b.cls=Math.max(0,Math.min(classes.length-1,b.cls));
+        }
+      });
+      if(clsBad)warn='，其中 '+clsBad+' 个框类别超出范围已自动归到合法类别，请检查类别偏移';
+    }
+    if(added.length){snap();boxes.push(...added);markDirty();}
+    st('✨ 模型检测 '+d.boxes.length+' 个框，新增 '+added.length+' 个 (去重 '+
+       (d.boxes.length-added.length)+' 个，过滤退化框 '+badCount+' 个)'+warn);
+    redraw();
+  });
+}
+function clearBoxes(){if(!boxes.length)return;snap();boxes=[];selIdx=-1;markDirty();redraw();}
+
+function openSplit(){
+  saveLabels(true);
+  const out=document.getElementById('splitOut');
+  if(!out.value){
+    // 默认在图片父目录旁建一个 _split
+    out.value='';
+  }
+  document.getElementById('splitMsg').textContent='';
+  document.getElementById('splitMask').style.display='flex';
+}
+function doSplit(){
+  const out_dir=document.getElementById('splitOut').value.trim();
+  if(!out_dir){alert('请填写输出目录');return;}
+  const val_ratio=parseFloat(document.getElementById('splitRatio').value)||0.2;
+  const seed=parseInt(document.getElementById('splitSeed').value)||0;
+  const move=document.getElementById('splitMove').checked;
+  const write_yaml=document.getElementById('splitYaml').checked;
+  const msg=document.getElementById('splitMsg');
+  const btn=document.getElementById('splitGo');
+  btn.disabled=true;msg.style.color='#8b93a4';msg.textContent='划分中，请稍候...';
+  fetch('/api/split',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({out_dir,val_ratio,seed,move,write_yaml})}).then(r=>r.json()).then(d=>{
+    btn.disabled=false;
+    if(!d.ok){msg.style.color='#ef4444';msg.textContent='✗ '+d.msg;return;}
+    const c=d.counts;
+    msg.style.color='#22c55e';
+    msg.innerHTML='✓ 划分完成！<br>'+
+      `训练集 ${c.train} 张 (含反例 ${c.train_empty})<br>`+
+      `验证集 ${c.val} 张 (含反例 ${c.val_empty})<br>`+
+      `输出: ${d.out_dir}`+(d.yaml?`<br>已生成: ${d.yaml}`:'');
+    st('✓ 数据集划分完成');
+  }).catch(e=>{btn.disabled=false;msg.style.color='#ef4444';msg.textContent='✗ '+e;});
+}
+
+document.addEventListener('keydown',e=>{
+  if(document.getElementById('modalMask').style.display==='flex')return;
+  if(document.getElementById('splitMask').style.display==='flex')return;
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
+  if(e.ctrlKey||e.metaKey){
+    if(e.key.toLowerCase()==='z'){e.preventDefault();if(e.shiftKey)redo();else undo();}
+    else if(e.key.toLowerCase()==='y'){e.preventDefault();redo();}
+    return;
+  }
+  const k=e.key.toLowerCase();
+  if(k==='a')go(-1);
+  else if(k==='d')go(1);
+  else if(k==='s'){e.preventDefault();saveLabels();}
+  else if(k==='e')predict();
+  else if(e.key==='Delete'){if(selIdx>=0){snap();boxes.splice(selIdx,1);selIdx=-1;markDirty();redraw();}}
+  else if(e.key>='0'&&e.key<='9'){const n=parseInt(e.key);if(n<classes.length){if(selIdx>=0){snap();boxes[selIdx].cls=n;markDirty();}else{curCls=n;buildClsBtns();}redraw();}}
+});
+setInterval(()=>{if(dirty&&total>0)saveLabels(true);},10000);
+window.addEventListener('beforeunload',e=>{if(dirty){e.preventDefault();e.returnValue='';}});
+window.addEventListener('blur',()=>{if(dirty&&total>0)saveLabels(true);});
+window.addEventListener('resize',()=>{if(imgW)fit();});
+</script>
+</body>
+</html>
+"""
+
+
+def open_browser():
+    webbrowser.open(f"http://127.0.0.1:{PORT}")
+
+
+if __name__ == "__main__":
+    print("=" * 52)
+    print("  YOLO 标注工具启动中...")
+    print("=" * 52)
+    # 关键:先清理占用端口的旧实例,否则"重启"只会连回旧服务器,
+    # 显示的还是上一次的文件夹。
+    if not free_port_if_stale(PORT):
+        print(f"  端口 {PORT} 被占用且无法自动清理,已退出。")
+        input("  按回车键关闭...")
+        sys.exit(1)
+    print(f"  浏览器将自动打开 http://127.0.0.1:{PORT}")
+    print("  关闭此窗口即可退出工具")
+    print("=" * 52)
+    threading.Timer(1.5, open_browser).start()
+    app.run(host="127.0.0.1", port=PORT, debug=False)

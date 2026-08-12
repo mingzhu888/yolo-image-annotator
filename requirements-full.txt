@@ -1,0 +1,3 @@
+# 完整依赖：手动标注 + YOLO 模型辅助标注
+-r requirements.txt
+ultralytics>=8.0
