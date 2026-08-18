@@ -127,6 +127,7 @@ STATE = {
     "images": [],
     "classes": [],
     "exclusive_groups": [],   # 互斥类别组 [["Belt_off","Belt_on"], ...]
+    "allow_multi_cls": False, # 是否允许同一目标保留多个不同类别
     "models": [],        # 已加载的模型列表 [{id,name,path,model,model_classes,cls_offset,conf,only_cls}]
     "auto": None,        # 自动化标注进度
 }
@@ -252,6 +253,14 @@ def _resolve_exclusive(boxes, excl_ids, iou_thr):
     return kept
 
 
+def _current_excl_ids():
+    """默认: 同一目标只保留置信度最高的类别(所有类别视为互斥)。
+    开启 allow_multi_cls 后,只对显式声明的互斥组生效。"""
+    if not STATE.get("allow_multi_cls") and STATE["classes"]:
+        return [set(range(len(STATE["classes"])))]
+    return _exclusive_group_ids(STATE["exclusive_groups"], STATE["classes"])
+
+
 def _validate_boxes(boxes, n_cls):
     """校验并格式化标签;返回 (lines, errors)。"""
     lines = []
@@ -342,11 +351,13 @@ def api_open():
     STATE["classes"] = classes if classes else STATE["classes"]
     STATE["exclusive_groups"] = _parse_exclusive_groups(
         data.get("exclusive_groups", ""))
+    STATE["allow_multi_cls"] = bool(data.get("allow_multi_cls", False))
 
     cfg = load_config()
     cfg.update({"img_dir": img_dir, "label_dir": label_dir,
                 "classes": ",".join(STATE["classes"]),
-                "exclusive_groups": str(data.get("exclusive_groups", "")).strip()})
+                "exclusive_groups": str(data.get("exclusive_groups", "")).strip(),
+                "allow_multi_cls": STATE["allow_multi_cls"]})
     save_config(cfg)
 
     file_status = [{"name": n, "done": has_label(n)} for n in imgs]
@@ -780,8 +791,7 @@ def _predict_all(path, iou_thr=0.5):
                       "error": None})
     merged = _nms_boxes(collected, iou_thr)
     n_after_nms = len(merged)
-    excl_ids = _exclusive_group_ids(STATE["exclusive_groups"],
-                                    STATE["classes"])
+    excl_ids = _current_excl_ids()
     merged = _resolve_exclusive(merged, excl_ids, iou_thr)
     excl_dropped = n_after_nms - len(merged)
     kept_by_source = defaultdict(int)
@@ -861,8 +871,7 @@ def _auto_worker(skip_labeled, iou_thr):
                     existing = [dict(b, conf=1.0)
                                 for b in _read_label_boxes(lp)]
                     merged = _dedupe_with_existing(existing, preds, iou_thr)
-                    excl_ids = _exclusive_group_ids(
-                        STATE["exclusive_groups"], STATE["classes"])
+                    excl_ids = _current_excl_ids()
                     merged = _resolve_exclusive(merged, excl_ids, iou_thr)
                     _write_label_file(lp, merged)
                     st["saved"] += 1
@@ -1114,7 +1123,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.8</span></div>
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.9</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">配置</button>
   <button class="tbtn ghost" id="themeBtn" onclick="toggleTheme()" title="切换深色 / 浅色">浅色</button>
@@ -1189,9 +1198,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="hint">第1个=0, 第2个=1 ... 建议用英文，避免训练时中文路径问题</div>
       </div>
       <div class="field">
-        <label>互斥类别组（同一目标只保留一个，组内逗号、多组分号）</label>
-        <input id="exclGroups" type="text" placeholder="如 Belt_off,Belt_on;helmet,no_helmet">
-        <div class="hint">如“安全带系/未系”“戴帽/未戴帽”这类不可能同时成立的类别。预测时同组类别在同一目标上只保留置信度最高的。</div>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input id="allowMultiCls" type="checkbox" style="width:auto;"> 同一目标允许多个类别同时保留（如安全帽 + 反光衣）
+        </label>
+        <div class="hint">默认不勾选：同一目标上多个类别只保留置信度最高的（如 Belt_off / Belt_on 不会同时出现）。勾选后，同一目标上的不同类别都会保留。</div>
       </div>
     </div>
 
@@ -1290,7 +1300,7 @@ let drawing=false,sx=0,sy=0,ex=0,ey=0;
 let panning=false,panX=0,panY=0;
 let modelSlots=[];
 let modelKeySeq=1;
-let exclusiveGroups=[];
+let allowMultiCls=false;
 let autoTimer=null;
 let autoActive=false;
 let predicting=false;
@@ -1388,7 +1398,7 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   if(c.img_dir)document.getElementById('imgDir').value=c.img_dir;
   if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
   if(c.classes)document.getElementById('classesIn').value=c.classes;
-  if(c.exclusive_groups)document.getElementById('exclGroups').value=c.exclusive_groups;
+  if(c.allow_multi_cls)document.getElementById('allowMultiCls').checked=true;
   initModelSlots(c.models||[]);
   openModal();
 });
@@ -1398,13 +1408,9 @@ function openFolder(){
   const label_dir=document.getElementById('labelDir').value;
   classes=document.getElementById('classesIn').value.split(',').map(s=>s.trim()).filter(s=>s);
   if(!classes.length){alert('请至少填写一个类别');return;}
-  const exclRaw=document.getElementById('exclGroups').value.trim();
-  exclusiveGroups=exclRaw.split(';').map(g=>g.split(',').map(s=>s.trim()).filter(Boolean))
-    .filter(g=>g.length>=2)
-    .map(g=>g.map(n=>classes.indexOf(n)))
-    .filter(g=>g.every(i=>i>=0));
+  allowMultiCls=document.getElementById('allowMultiCls').checked;
   fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({img_dir,label_dir,classes,exclusive_groups:exclRaw})}).then(r=>r.json()).then(d=>{
+    body:JSON.stringify({img_dir,label_dir,classes,allow_multi_cls:allowMultiCls})}).then(r=>r.json()).then(d=>{
     if(!d.ok){alert(d.msg);return;}
     total=d.count;idx=0;files=d.files;
     const cf=document.getElementById('curFolder');
@@ -1834,9 +1840,6 @@ function iou(a,b){
   const union=((ax2-ax1)*(ay2-ay1))+((bx2-bx1)*(by2-by1))-inter;
   return union>0?inter/union:0;
 }
-function inSameExclGroup(aCls,bCls){
-  return exclusiveGroups.some(g=>g.includes(aCls)&&g.includes(bCls));
-}
 function sameTarget(a,b,iouThr){
   if(iou(a,b)>=iouThr)return true;
   const aa=a.w*a.h,ba=b.w*b.h;
@@ -1855,11 +1858,11 @@ function dedupeAppend(newBoxes,iouThr){
     let dup=false;
     for(const ob of boxes){
       if(ob.cls===nb.cls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
-      if(inSameExclGroup(ob.cls,nb.cls)&&sameTarget(ob,nb,iouThr)){dup=true;break;}
+      if(!allowMultiCls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
     }
     if(!dup){for(const ob of out){
       if(ob.cls===nb.cls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
-      if(inSameExclGroup(ob.cls,nb.cls)&&sameTarget(ob,nb,iouThr)){dup=true;break;}
+      if(!allowMultiCls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
     }}
     if(!dup)out.push(nb);
   });
