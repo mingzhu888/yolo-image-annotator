@@ -184,6 +184,28 @@ def _iou_boxes(a, b):
     return inter / union if union > 0 else 0
 
 
+def _same_target(a, b, iou_thr):
+    """判断两个同类框是否指向同一目标。
+    IoU 超过阈值,或一个框几乎被另一个框包含(小框中心在大框内且面积占比足够大)
+    都视为重复,避免不同模型框大小差异导致同一目标出多个框。"""
+    if _iou_boxes(a, b) >= iou_thr:
+        return True
+    a_area = a["w"] * a["h"]
+    b_area = b["w"] * b["h"]
+    if a_area <= 0 or b_area <= 0:
+        return False
+    big, small = (a, b) if a_area >= b_area else (b, a)
+    small_area = small["w"] * small["h"]
+    big_area = big["w"] * big["h"]
+    if small_area / big_area < 0.35:
+        return False
+    in_x = (big["cx"] - big["w"] / 2 <= small["cx"] <=
+            big["cx"] + big["w"] / 2)
+    in_y = (big["cy"] - big["h"] / 2 <= small["cy"] <=
+            big["cy"] + big["h"] / 2)
+    return in_x and in_y
+
+
 def _validate_boxes(boxes, n_cls):
     """校验并格式化标签;返回 (lines, errors)。"""
     lines = []
@@ -356,9 +378,12 @@ def api_models():
 
 
 def _load_meituan_v6n(model_path):
-    """加载美团 YOLOv6n checkpoint（非 ultralytics 格式）。"""
+    """加载美团 YOLOv6n checkpoint（非 ultralytics 格式）。
+    YOLOv6 源码目录优先级: 环境变量 YOLOV6_REPO > 配置 v6n_repo > 程序目录下 YOLOv6。"""
     import torch
-    repo = r"F:\数据集与原始算法包\YOLOv6"
+    repo = (os.environ.get("YOLOV6_REPO")
+            or (load_config().get("v6n_repo") or "")
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "YOLOv6"))
     if repo not in sys.path:
         sys.path.insert(0, repo)
     from yolov6.models import effidehead
@@ -467,6 +492,11 @@ def api_load_model():
     model_path = data.get("model_path", "").strip().strip('"')
     if not model_path or not os.path.isfile(model_path):
         return jsonify({"ok": False, "msg": f"模型文件不存在: {model_path}"})
+    norm_path = os.path.normcase(os.path.abspath(model_path))
+    for m in STATE["models"]:
+        if os.path.normcase(os.path.abspath(m["path"])) == norm_path:
+            return jsonify({"ok": False,
+                            "msg": f"该模型已加载: {m['name']}，请勿重复添加"})
     try:
         from ultralytics import YOLO
     except ImportError:
@@ -634,13 +664,17 @@ def _predict_all(path, iou_thr=0.5):
                         if m["only_cls"] is not None and model_cls not in m["only_cls"]:
                             continue
                         raw += 1
-                        xc, yc, ww, hh = b.xywhn[0].tolist()
+                        try:
+                            xc, yc, ww, hh = b.xywhn[0].tolist()
+                            conf = float(b.conf[0]) if b.conf is not None else 1.0
+                        except Exception:
+                            continue
                         cls = model_cls + m["cls_offset"]
                         if n_cls:
                             cls = max(0, min(n_cls - 1, cls))
                         collected.append({"cls": cls, "cx": xc, "cy": yc,
                                           "w": ww, "h": hh,
-                                          "conf": float(b.conf[0]),
+                                          "conf": conf,
                                           "source": m["id"]})
         except Exception as e:
             stats.append({"name": m["name"], "raw": 0, "kept": 0,
@@ -668,7 +702,7 @@ def _nms_boxes(boxes, iou_thr):
     for cls, items in by_cls.items():
         items.sort(key=lambda x: x.get("conf", 0), reverse=True)
         for b in items:
-            if all(_iou_boxes(b, k) < iou_thr for k in kept
+            if all(not _same_target(b, k, iou_thr) for k in kept
                    if k["cls"] == cls):
                 kept.append(b)
     return kept
@@ -678,7 +712,7 @@ def _dedupe_with_existing(existing, preds, iou_thr):
     """预测框与已有框做同类去重后合并。"""
     out = [dict(b) for b in existing]
     for p in preds:
-        if any(_iou_boxes(p, b) >= iou_thr for b in out
+        if any(_same_target(p, b, iou_thr) for b in out
                if b["cls"] == p["cls"]):
             continue
         out.append(p)
@@ -1147,6 +1181,7 @@ let modelSlots=[];
 let modelKeySeq=1;
 let autoTimer=null;
 let autoActive=false;
+let predicting=false;
 const overlayTimers={};
 let dirty=false;
 let undoStack=[],redoStack=[];
@@ -1648,23 +1683,39 @@ function iou(a,b){
   const union=((ax2-ax1)*(ay2-ay1))+((bx2-bx1)*(by2-by1))-inter;
   return union>0?inter/union:0;
 }
+function sameTarget(a,b,iouThr){
+  if(iou(a,b)>=iouThr)return true;
+  const aa=a.w*a.h,ba=b.w*b.h;
+  if(!(aa>0&&ba>0))return false;
+  const big=aa>=ba?a:b;
+  const small=big===a?b:a;
+  const sArea=small.w*small.h,bigArea=big.w*big.h;
+  if(sArea/bigArea<0.35)return false;
+  return (big.cx-big.w/2<=small.cx&&small.cx<=big.cx+big.w/2&&
+          big.cy-big.h/2<=small.cy&&small.cy<=big.cy+big.h/2);
+}
 function dedupeAppend(newBoxes,iouThr){
   iouThr=iouThr||0.5;
   const out=[];
   newBoxes.forEach(nb=>{
     let dup=false;
-    for(const ob of boxes){if(ob.cls===nb.cls&&iou(ob,nb)>=iouThr){dup=true;break;}}
-    if(!dup){for(const ob of out){if(ob.cls===nb.cls&&iou(ob,nb)>=iouThr){dup=true;break;}}}
+    for(const ob of boxes){if(ob.cls===nb.cls&&sameTarget(ob,nb,iouThr)){dup=true;break;}}
+    if(!dup){for(const ob of out){if(ob.cls===nb.cls&&sameTarget(ob,nb,iouThr)){dup=true;break;}}}
     if(!dup)out.push(nb);
   });
   return out;
 }
 function predict(){
+  if(predicting)return;
   if(!modelSlots.some(s=>s.id)){st('请先在配置中加载模型');return;}
+  predicting=true;
+  const btn=document.getElementById('btnPredict');if(btn)btn.disabled=true;
   const iou=parseFloat(document.getElementById('iouThr').value)||0.5;
   st('正在预测...');
   fetch('/api/predict/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({iou})}).then(r=>r.json()).then(d=>{
+    predicting=false;
+    if(btn)btn.disabled=false;
     if(!d.ok){st('预测失败: '+(d.msg||''));return;}
     // 过滤模型可能输出的退化框(宽高<=0/非数字),避免出现"看不见、点不中、存不了"的框
     const validBoxes=d.boxes.filter(b=>b&&isFinite(b.cx)&&isFinite(b.cy)&&b.w>0&&b.h>0);
@@ -1682,9 +1733,14 @@ function predict(){
       if(clsBad)warn='，其中 '+clsBad+' 个框类别超出范围已自动归到合法类别，请检查类别偏移';
     }
     if(added.length){snap();boxes.push(...added);markDirty();}
-    const stats=(d.stats||[]).map(s=>s.name+': '+s.raw+'→'+s.kept).join(' / ');
+    const stats=(d.stats||[]).map(s=>s.error? s.name+': 失败('+s.error+')'
+                                              : s.name+': '+s.raw+'→'+s.kept).join(' / ');
     st('预测合并: '+stats+' 新增 '+added.length+' 个 (过滤退化框 '+badCount+' 个)'+warn);
     redraw();
+  }).catch(()=>{
+    predicting=false;
+    if(btn)btn.disabled=false;
+    st('预测失败: 请求异常');
   });
 }
 function clearBoxes(){if(!boxes.length)return;snap();boxes=[];selIdx=-1;markDirty();redraw();}
