@@ -356,6 +356,9 @@ def _model_info(m):
             "backend": m.get("backend"),
             "model_classes": m["model_classes"],
             "cls_offset": m["cls_offset"], "conf": m["conf"],
+            "suggested_offset": _suggest_offset(m["model_classes"],
+                                                STATE["classes"]),
+            "auto_offset": m.get("auto_offset", False),
             "only_cls": sorted(m["only_cls"]) if m["only_cls"] is not None else None}
 
 
@@ -375,6 +378,20 @@ def _persist_model_meta():
 def api_models():
     return jsonify({"ok": True,
                     "models": [_model_info(m) for m in STATE["models"]]})
+
+
+@app.route("/api/suggest_offset", methods=["POST"])
+def api_suggest_offset():
+    data = request.get_json() or {}
+    try:
+        mid = int(data.get("id", -1))
+    except (TypeError, ValueError):
+        mid = -1
+    for m in STATE["models"]:
+        if m["id"] == mid:
+            sug = _suggest_offset(m["model_classes"], STATE["classes"])
+            return jsonify({"ok": True, "suggested_offset": sug})
+    return jsonify({"ok": False, "msg": "模型不存在"})
 
 
 def _load_meituan_v6n(model_path):
@@ -486,6 +503,26 @@ def _infer_meituan(model, img_path, conf):
     return _nms_boxes(raw, 0.5)
 
 
+def _norm_cls_name(s):
+    """类别名归一化:去掉空格/下划线/连字符并转小写。"""
+    return re.sub(r"[\s_\-]+", "", str(s)).lower()
+
+
+def _suggest_offset(model_classes, dataset_classes):
+    """按类别名自动推断类别偏移。
+    模型类别必须能在数据集类别里按顺序连续匹配;否则返回 None。"""
+    if not model_classes:
+        return None
+    dmap = {_norm_cls_name(c): i for i, c in enumerate(dataset_classes)}
+    hits = [dmap.get(_norm_cls_name(c)) for c in model_classes]
+    if any(h is None for h in hits):
+        return None
+    base = hits[0]
+    if hits == list(range(base, base + len(hits))):
+        return base
+    return None
+
+
 @app.route("/api/load_model", methods=["POST"])
 def api_load_model():
     data = request.get_json() or {}
@@ -519,6 +556,14 @@ def api_load_model():
         mid = 1
         if STATE["models"]:
             mid = max(m["id"] for m in STATE["models"]) + 1
+        raw_offset = data.get("cls_offset")
+        if raw_offset is None:
+            suggested = _suggest_offset(model_classes, STATE["classes"])
+            cls_offset = suggested if suggested is not None else 0
+            auto_offset = suggested is not None
+        else:
+            cls_offset = int(raw_offset or 0)
+            auto_offset = False
         entry = {
             "id": mid,
             "name": os.path.basename(model_path),
@@ -526,7 +571,8 @@ def api_load_model():
             "model": model,
             "backend": backend,
             "model_classes": model_classes,
-            "cls_offset": int(data.get("cls_offset", 0) or 0),
+            "cls_offset": cls_offset,
+            "auto_offset": auto_offset,
             "conf": float(data.get("conf", 0.25) or 0.25),
             "only_cls": _parse_only_cls(data.get("only_cls")),
         }
@@ -1008,7 +1054,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.6</span></div>
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.7</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">配置</button>
   <button class="tbtn ghost" id="themeBtn" onclick="toggleTheme()" title="切换深色 / 浅色">浅色</button>
@@ -1094,7 +1140,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <input id="iouThr" type="number" step="0.05" min="0" max="1" value="0.5">
         </div>
       </div>
-      <div class="hint">每个模型可单独设类别偏移和置信度；同类别重叠框按置信度只保留一个，不同类别同时保留（如安全帽 + 反光衣）。</div>
+      <div class="hint">加载模型时会按类别名称自动匹配类别偏移（忽略大小写/下划线）；匹配不上可点卡片里的“自动匹配偏移”。同类别重叠框只保留置信度高的，不同类别（如安全帽 + 反光衣）同时保留。</div>
     </div>
 
     <div class="actions">
@@ -1374,8 +1420,27 @@ function buildModelCard(s){
   cfWrap.appendChild(cfLb);cfWrap.appendChild(cf);
   opts.appendChild(offWrap);opts.appendChild(cfWrap);
   card.appendChild(opts);
+  if(s.id&&classes.length){
+    const autoBtn=document.createElement('button');
+    autoBtn.className='tbtn';
+    autoBtn.style.cssText='margin-top:8px;height:28px;padding:0 10px;font-size:12px;';
+    autoBtn.textContent='自动匹配偏移';
+    autoBtn.title='按模型类别名与数据集类别名重新推断偏移';
+    autoBtn.onclick=()=>applySuggested(s.key);
+    card.appendChild(autoBtn);
+  }
   const status=document.createElement('div');status.className='mc-status';
-  if(s.id)status.textContent='模型类别: '+s.model_classes.join(', ');
+  if(s.id){
+    if(classes.length){
+      const mapTxt=s.model_classes.map((c,i)=>{
+        const aid=i+s.cls_offset;
+        return c+' → '+(classes[aid]||('ID '+aid));
+      }).join('，');
+      status.textContent='偏移 '+s.cls_offset+(s.auto_offset?'（自动匹配）':'')+' | '+mapTxt;
+    }else{
+      status.textContent='模型类别: '+s.model_classes.join(', ');
+    }
+  }
   card.appendChild(status);
   if(s.id){
     const clsBox=document.createElement('div');clsBox.className='mc-cls';
@@ -1413,9 +1478,23 @@ function loadModelSlot(key){
   const s=modelSlots.find(x=>x.key===key);
   if(!s||!s.path.trim()){alert('请先填写模型路径');return;}
   fetch('/api/load_model',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({model_path:s.path.trim(),cls_offset:s.cls_offset,conf:s.conf})}).then(r=>r.json()).then(d=>{
+    body:JSON.stringify({model_path:s.path.trim(),cls_offset:null,conf:s.conf})}).then(r=>r.json()).then(d=>{
     if(!d.ok){alert('加载失败: '+(d.msg||'未知错误'));return;}
     applyServerModels(d.models);
+  });
+}
+function applySuggested(key){
+  const s=modelSlots.find(x=>x.key===key);
+  if(!s||!s.id)return;
+  fetch('/api/suggest_offset',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:s.id})}).then(r=>r.json()).then(d=>{
+    if(!d.ok){alert(d.msg||'模型不存在');return;}
+    if(d.suggested_offset===null||d.suggested_offset===undefined){
+      alert('未能自动匹配：请检查模型类别名与数据集类别名是否一致');
+      return;
+    }
+    s.cls_offset=d.suggested_offset;
+    updateModelSlot(s.key,{cls_offset:s.cls_offset});
   });
 }
 function updateModelSlot(key,patch){
@@ -1787,7 +1866,7 @@ function openAuto(){
   document.getElementById('autoMsg').textContent='';
   document.getElementById('autoStartBtn').disabled=false;
   const cb=document.getElementById('autoCancelBtn');
-  cb.disabled=true;cb.textContent='取消';cb.onclick=cancelAuto;
+  cb.disabled=false;cb.textContent='取消';cb.onclick=cancelAuto;
   openOverlay('autoMask');
 }
 function startAuto(){
@@ -1829,9 +1908,9 @@ function pollAuto(){
   });
 }
 function cancelAuto(){
-  fetch('/api/auto_cancel',{method:'POST'}).then(()=>{
-    document.getElementById('autoMsg').textContent='正在取消，请稍候...';
-  });
+  fetch('/api/auto_cancel',{method:'POST'});
+  autoActive=false;
+  closeOverlay('autoMask');
 }
 function refreshAfterAuto(){
   fetch('/api/files').then(r=>r.json()).then(d=>{

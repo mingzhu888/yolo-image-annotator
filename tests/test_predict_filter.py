@@ -164,6 +164,35 @@ def test_duplicate_path_rejected():
         assert "已加载" in r["msg"]
 
 
+def test_suggest_offset():
+    from annotate_tool import _suggest_offset
+    ds = ["Belt_off", "Belt_on", "extinguisher"]
+    assert _suggest_offset(["extinguisher"], ds) == 2
+    assert _suggest_offset(["belt_off", "belt_on"], ds) == 0
+    assert _suggest_offset(["Belt_On", "Extinguisher"], ds) == 1
+    assert _suggest_offset(["belt_off", "extinguisher"], ds) is None  # 不连续
+    assert _suggest_offset(["helmet"], ds) is None
+    assert _suggest_offset([], ds) is None
+
+
+def test_suggest_offset_endpoint():
+    with tempfile.TemporaryDirectory() as tmp:
+        at.STATE["img_dir"] = tmp
+        at.STATE["label_dir"] = tmp
+        at.STATE["images"] = ["a.jpg"]
+        at.STATE["classes"] = ["Belt_off", "Belt_on", "extinguisher"]
+        at.STATE["models"] = [{
+            "id": 1, "name": "m", "path": "x", "backend": "ultralytics",
+            "model_classes": ["extinguisher"], "cls_offset": 0,
+            "conf": 0.25, "only_cls": None, "auto_offset": False,
+        }]
+        at.STATE["auto"] = None
+        r = at.app.test_client().post(
+            "/api/suggest_offset", json={"id": 1}).get_json()
+        assert r["ok"]
+        assert r["suggested_offset"] == 2
+
+
 if __name__ == "__main__":
     test_no_filter_keeps_all()
     test_filter_one_class()
@@ -172,4 +201,6 @@ if __name__ == "__main__":
     test_nms_keeps_different_classes()
     test_nms_merges_contained_boxes()
     test_duplicate_path_rejected()
+    test_suggest_offset()
+    test_suggest_offset_endpoint()
     print("全部测试通过")
