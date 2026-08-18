@@ -292,8 +292,46 @@ def api_files():
                               for n in STATE["images"]]})
 
 
+def _pick_path(is_dir=False, title="选择"):
+    """弹出原生选择窗口(本机工具专用),返回路径或 None。"""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+        if is_dir:
+            return filedialog.askdirectory(title=title, parent=root) or None
+        return filedialog.askopenfilename(
+            title=title, parent=root,
+            filetypes=[("模型文件", "*.pt *.onnx *.ptq"),
+                       ("所有文件", "*.*")]) or None
+    finally:
+        root.destroy()
+
+
+@app.route("/api/pick_file", methods=["POST"])
+def api_pick_file():
+    path = _pick_path(False, "选择模型文件")
+    if not path:
+        return jsonify({"ok": False, "msg": "未选择文件或无法打开选择窗口"})
+    return jsonify({"ok": True, "path": path})
+
+
+@app.route("/api/pick_folder", methods=["POST"])
+def api_pick_folder():
+    path = _pick_path(True, "选择文件夹")
+    if not path:
+        return jsonify({"ok": False, "msg": "未选择文件夹或无法打开选择窗口"})
+    return jsonify({"ok": True, "path": path})
+
+
 def _model_info(m):
     return {"id": m["id"], "name": m["name"], "path": m["path"],
+            "backend": m.get("backend"),
             "model_classes": m["model_classes"],
             "cls_offset": m["cls_offset"], "conf": m["conf"],
             "only_cls": sorted(m["only_cls"]) if m["only_cls"] is not None else None}
@@ -303,6 +341,7 @@ def _persist_model_meta():
     cfg = load_config()
     cfg["models"] = [{
         "path": m["path"],
+        "backend": m.get("backend"),
         "cls_offset": m["cls_offset"],
         "conf": m["conf"],
         "only_cls": sorted(m["only_cls"]) if m["only_cls"] is not None else None,
@@ -314,6 +353,112 @@ def _persist_model_meta():
 def api_models():
     return jsonify({"ok": True,
                     "models": [_model_info(m) for m in STATE["models"]]})
+
+
+def _load_meituan_v6n(model_path):
+    """加载美团 YOLOv6n checkpoint（非 ultralytics 格式）。"""
+    import torch
+    repo = r"F:\数据集与原始算法包\YOLOv6"
+    if repo not in sys.path:
+        sys.path.insert(0, repo)
+    from yolov6.models import effidehead
+    from yolov6.layers.common import SimConv
+    effidehead.Conv = SimConv
+    ck = torch.load(model_path, map_location="cpu")
+    model = ck.get("model") or ck.get("ema")
+    if model is None:
+        raise RuntimeError("checkpoint 里没有 model/ema")
+    if hasattr(model, "module"):
+        model = model.module
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    return model.float().to(device).eval()
+
+
+def _read_yaml_names(path, nc):
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        names = data.get("names")
+        if isinstance(names, dict):
+            names = [names.get(i, "class_%d" % i) for i in range(nc)]
+        elif isinstance(names, (list, tuple)):
+            names = [str(n) for n in names[:nc]]
+            while len(names) < nc:
+                names.append("class_%d" % len(names))
+        else:
+            names = None
+        return names
+    except Exception:
+        return None
+
+
+def _meituan_class_names(model_path, model):
+    nc = None
+    for attr in ("detect", "model"):
+        try:
+            nc = int(getattr(model, attr).nc)
+            break
+        except Exception:
+            continue
+    if nc is None:
+        nc = 0
+    d = os.path.dirname(os.path.abspath(model_path))
+    for _ in range(8):
+        for fn in ("data_meituan.yaml", "data.yaml"):
+            p = os.path.join(d, fn)
+            if os.path.isfile(p):
+                names = _read_yaml_names(p, nc)
+                if names:
+                    return names
+        nd = os.path.dirname(d)
+        if nd == d:
+            break
+        d = nd
+    return ["class_%d" % i for i in range(nc)]
+
+
+def _infer_meituan(model, img_path, conf):
+    """美团 v6n 推理，返回归一化 [{cls,cx,cy,w,h,conf}]，已做类内 NMS。"""
+    import cv2
+    import numpy as np
+    import torch
+    img = cv2.imread(img_path)
+    if img is None:
+        raise RuntimeError("无法读取图片")
+    h0, w0 = img.shape[:2]
+    S = 640
+    scale = min(S / h0, S / w0)
+    nw, nh = int(w0 * scale), int(h0 * scale)
+    resized = cv2.resize(img, (nw, nh))
+    padded = np.full((S, S, 3), 114, dtype=np.uint8)
+    dx, dy = (S - nw) // 2, (S - nh) // 2
+    padded[dy:dy + nh, dx:dx + nw] = resized
+    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+    x = np.ascontiguousarray(
+        np.transpose(rgb.astype(np.float32) / 255.0, (2, 0, 1))[None])
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        out = model(torch.from_numpy(x).float().to(device))
+    det = out[0][0].cpu().numpy()
+    if det.shape[0] == 0:
+        return []
+    boxes = det[:, :4]
+    scores = det[:, 5:]
+    confs = scores.max(axis=1)
+    clss = scores.argmax(axis=1)
+    keep = confs >= conf
+    boxes, confs, clss = boxes[keep], confs[keep], clss[keep]
+    if len(boxes) == 0:
+        return []
+    cx = (boxes[:, 0] - dx) / scale / w0
+    cy = (boxes[:, 1] - dy) / scale / h0
+    ww = boxes[:, 2] / scale / w0
+    hh = boxes[:, 3] / scale / h0
+    raw = [{"cls": int(clss[i]), "cx": float(cx[i]), "cy": float(cy[i]),
+            "w": float(ww[i]), "h": float(hh[i]), "conf": float(confs[i])}
+           for i in range(len(boxes))]
+    return _nms_boxes(raw, 0.5)
 
 
 @app.route("/api/load_model", methods=["POST"])
@@ -329,12 +474,18 @@ def api_load_model():
                         "msg": "未安装模型辅助依赖 ultralytics。请先执行: "
                                 "pip install -r requirements-full.txt"})
     try:
-        model = YOLO(model_path)
-        names = model.names
-        if isinstance(names, dict):
-            model_classes = [names[i] for i in sorted(names.keys())]
-        else:
-            model_classes = list(names)
+        try:
+            model = YOLO(model_path)
+            names = model.names
+            if isinstance(names, dict):
+                model_classes = [names[i] for i in sorted(names.keys())]
+            else:
+                model_classes = list(names)
+            backend = "ultralytics"
+        except Exception:
+            model = _load_meituan_v6n(model_path)
+            model_classes = _meituan_class_names(model_path, model)
+            backend = "meituan_v6n"
         mid = 1
         if STATE["models"]:
             mid = max(m["id"] for m in STATE["models"]) + 1
@@ -343,6 +494,7 @@ def api_load_model():
             "name": os.path.basename(model_path),
             "path": model_path,
             "model": model,
+            "backend": backend,
             "model_classes": model_classes,
             "cls_offset": int(data.get("cls_offset", 0) or 0),
             "conf": float(data.get("conf", 0.25) or 0.25),
@@ -459,27 +611,41 @@ def _predict_all(path, iou_thr=0.5):
     collected = []
     stats = []
     for m in STATE["models"]:
+        raw = 0
         try:
-            res = m["model"].predict(path, conf=m["conf"], verbose=False)[0]
+            if m.get("backend") == "meituan_v6n":
+                preds = _infer_meituan(m["model"], path, m["conf"])
+                raw = len(preds)
+                for b in preds:
+                    model_cls = b["cls"]
+                    if m["only_cls"] is not None and model_cls not in m["only_cls"]:
+                        continue
+                    cls = model_cls + m["cls_offset"]
+                    if n_cls:
+                        cls = max(0, min(n_cls - 1, cls))
+                    collected.append({"cls": cls, "cx": b["cx"], "cy": b["cy"],
+                                      "w": b["w"], "h": b["h"],
+                                      "conf": b["conf"], "source": m["id"]})
+            else:
+                res = m["model"].predict(path, conf=m["conf"], verbose=False)[0]
+                if res.boxes is not None:
+                    for b in res.boxes:
+                        model_cls = int(b.cls[0])
+                        if m["only_cls"] is not None and model_cls not in m["only_cls"]:
+                            continue
+                        raw += 1
+                        xc, yc, ww, hh = b.xywhn[0].tolist()
+                        cls = model_cls + m["cls_offset"]
+                        if n_cls:
+                            cls = max(0, min(n_cls - 1, cls))
+                        collected.append({"cls": cls, "cx": xc, "cy": yc,
+                                          "w": ww, "h": hh,
+                                          "conf": float(b.conf[0]),
+                                          "source": m["id"]})
         except Exception as e:
             stats.append({"name": m["name"], "raw": 0, "kept": 0,
                           "error": str(e)})
             continue
-        raw = 0
-        if res.boxes is not None:
-            for b in res.boxes:
-                model_cls = int(b.cls[0])
-                if m["only_cls"] is not None and model_cls not in m["only_cls"]:
-                    continue
-                raw += 1
-                xc, yc, ww, hh = b.xywhn[0].tolist()
-                cls = model_cls + m["cls_offset"]
-                if n_cls:
-                    cls = max(0, min(n_cls - 1, cls))
-                collected.append({"cls": cls, "cx": xc, "cy": yc,
-                                  "w": ww, "h": hh,
-                                  "conf": float(b.conf[0]),
-                                  "source": m["id"]})
         stats.append({"name": m["name"], "raw": raw, "kept": 0,
                       "error": None})
     merged = _nms_boxes(collected, iou_thr)
@@ -808,7 +974,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.5</span></div>
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.6</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">配置</button>
   <button class="tbtn ghost" id="themeBtn" onclick="toggleTheme()" title="切换深色 / 浅色">浅色</button>
@@ -865,11 +1031,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="gt">① 数据</div>
       <div class="field">
         <label>图片文件夹路径</label>
-        <input id="imgDir" type="text" placeholder="如 F:\data\images\train">
+        <div style="display:flex;gap:6px;">
+          <input id="imgDir" type="text" placeholder="如 F:\data\images\train">
+          <button class="tbtn" type="button" onclick="pickImgDir()" style="flex-shrink:0;">选择</button>
+        </div>
       </div>
       <div class="field">
         <label>标签文件夹路径 (留空 = 与图片同目录)</label>
-        <input id="labelDir" type="text" placeholder="如 F:\data\labels\train">
+        <div style="display:flex;gap:6px;">
+          <input id="labelDir" type="text" placeholder="如 F:\data\labels\train">
+          <button class="tbtn" type="button" onclick="pickLabelDir()" style="flex-shrink:0;">选择</button>
+        </div>
       </div>
       <div class="field">
         <label>类别 (英文，逗号分隔，顺序即为类别ID)</label>
@@ -1024,6 +1196,20 @@ function closeOverlay(id){
 }
 function openModal(){openOverlay('modalMask');}
 function closeModal(){closeOverlay('modalMask');}
+function pickFile(cb){
+  fetch('/api/pick_file',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.ok&&d.path)cb(d.path);
+    else if(d&&d.msg)alert(d.msg);
+  });
+}
+function pickFolder(cb){
+  fetch('/api/pick_folder',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.ok&&d.path)cb(d.path);
+    else if(d&&d.msg)alert(d.msg);
+  });
+}
+function pickImgDir(){pickFolder(p=>{document.getElementById('imgDir').value=p;});}
+function pickLabelDir(){pickFolder(p=>{document.getElementById('labelDir').value=p;});}
 
 function snap(){
   undoStack.push(JSON.parse(JSON.stringify(boxes)));
@@ -1123,7 +1309,13 @@ function buildModelCard(s){
   const path=document.createElement('input');path.type='text';
   path.value=s.path;path.placeholder='如 ...\\weights\\best.pt';
   if(s.id)path.readOnly=true;
+  path.addEventListener('input',()=>{s.path=path.value.trim();});
   top.appendChild(path);
+  const pickBtn=document.createElement('button');
+  pickBtn.className='tbtn';pickBtn.textContent='选择';pickBtn.title='打开文件窗口选择 .pt 模型';
+  pickBtn.disabled=!!s.id;
+  pickBtn.onclick=()=>pickFile(p=>{s.path=p;path.value=p;loadModelSlot(s.key);});
+  top.appendChild(pickBtn);
   const loadBtn=document.createElement('button');
   loadBtn.className='tbtn';loadBtn.textContent=s.id?'已加载':'加载模型';
   loadBtn.disabled=!!s.id;
