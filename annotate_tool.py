@@ -21,6 +21,7 @@ import socket
 import subprocess
 import threading
 import webbrowser
+from collections import defaultdict
 from pathlib import Path
 from flask import Flask, request, jsonify, send_file, Response
 from PIL import Image
@@ -125,8 +126,8 @@ STATE = {
     "label_dir": None,
     "images": [],
     "classes": [],
-    "model": None,
-    "model_path": None,
+    "models": [],        # 已加载的模型列表 [{id,name,path,model,model_classes,cls_offset,conf,only_cls}]
+    "auto": None,        # 自动化标注进度
 }
 
 
@@ -149,6 +150,79 @@ def has_label(name):
         return os.path.getsize(lp) > 0
     except OSError:
         return False
+
+
+def _read_label_boxes(lp):
+    """读取 YOLO 标签文件,返回 [{cls,cx,cy,w,h}]。"""
+    boxes = []
+    if os.path.isfile(lp):
+        for line in open(lp, "r", encoding="utf-8", errors="ignore"):
+            line = line.strip()
+            if not line:
+                continue
+            p = line.split()
+            if len(p) < 5:
+                continue
+            try:
+                boxes.append({"cls": int(float(p[0])),
+                              "cx": float(p[1]), "cy": float(p[2]),
+                              "w": float(p[3]), "h": float(p[4])})
+            except ValueError:
+                continue
+    return boxes
+
+
+def _iou_boxes(a, b):
+    ax1, ay1 = a["cx"] - a["w"] / 2, a["cy"] - a["h"] / 2
+    ax2, ay2 = a["cx"] + a["w"] / 2, a["cy"] + a["h"] / 2
+    bx1, by1 = b["cx"] - b["w"] / 2, b["cy"] - b["h"] / 2
+    bx2, by2 = b["cx"] + b["w"] / 2, b["cy"] + b["h"] / 2
+    inter = (max(0, min(ax2, bx2) - max(ax1, bx1)) *
+             max(0, min(ay2, by2) - max(ay1, by1)))
+    union = ((ax2 - ax1) * (ay2 - ay1) +
+             (bx2 - bx1) * (by2 - by1) - inter)
+    return inter / union if union > 0 else 0
+
+
+def _validate_boxes(boxes, n_cls):
+    """校验并格式化标签;返回 (lines, errors)。"""
+    lines = []
+    errors = []
+    for i, b in enumerate(boxes, 1):
+        try:
+            cls = int(b["cls"])
+            cx = float(b["cx"])
+            cy = float(b["cy"])
+            w = float(b["w"])
+            h = float(b["h"])
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"第{i}个框字段缺失或不是数字")
+            continue
+        errs = []
+        if n_cls and (cls < 0 or cls >= n_cls):
+            errs.append(f"类别 {cls} 超出范围 (0~{n_cls - 1})")
+        for k, v in (("cx", cx), ("cy", cy), ("w", w), ("h", h)):
+            if not math.isfinite(v) or not (0 <= v <= 1):
+                errs.append(f"{k}={v} 越界 (应为 0~1)")
+        if w <= 0 or h <= 0:
+            errs.append("宽高必须大于 0")
+        if errs:
+            errors.append(f"第{i}个框: " + "; ".join(errs))
+            continue
+        lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    return lines, errors
+
+
+def _write_label_file(lp, boxes):
+    """把框列表写入 YOLO 标签文件。"""
+    lines, errors = _validate_boxes(boxes, len(STATE["classes"]))
+    if errors:
+        raise ValueError("；".join(errors[:10]))
+    with open(lp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+        if lines:
+            f.write("\n")
+    return lines
 
 
 def load_config():
@@ -209,9 +283,42 @@ def api_open():
                     "classes": STATE["classes"], "files": file_status})
 
 
+@app.route("/api/files")
+def api_files():
+    if not STATE["images"]:
+        return jsonify({"ok": True, "files": []})
+    return jsonify({"ok": True,
+                    "files": [{"name": n, "done": has_label(n)}
+                              for n in STATE["images"]]})
+
+
+def _model_info(m):
+    return {"id": m["id"], "name": m["name"], "path": m["path"],
+            "model_classes": m["model_classes"],
+            "cls_offset": m["cls_offset"], "conf": m["conf"],
+            "only_cls": sorted(m["only_cls"]) if m["only_cls"] is not None else None}
+
+
+def _persist_model_meta():
+    cfg = load_config()
+    cfg["models"] = [{
+        "path": m["path"],
+        "cls_offset": m["cls_offset"],
+        "conf": m["conf"],
+        "only_cls": sorted(m["only_cls"]) if m["only_cls"] is not None else None,
+    } for m in STATE["models"]]
+    save_config(cfg)
+
+
+@app.route("/api/models")
+def api_models():
+    return jsonify({"ok": True,
+                    "models": [_model_info(m) for m in STATE["models"]]})
+
+
 @app.route("/api/load_model", methods=["POST"])
 def api_load_model():
-    data = request.get_json()
+    data = request.get_json() or {}
     model_path = data.get("model_path", "").strip().strip('"')
     if not model_path or not os.path.isfile(model_path):
         return jsonify({"ok": False, "msg": f"模型文件不存在: {model_path}"})
@@ -222,19 +329,65 @@ def api_load_model():
                         "msg": "未安装模型辅助依赖 ultralytics。请先执行: "
                                 "pip install -r requirements-full.txt"})
     try:
-        STATE["model"] = YOLO(model_path)
-        STATE["model_path"] = model_path
-        names = STATE["model"].names
+        model = YOLO(model_path)
+        names = model.names
         if isinstance(names, dict):
             model_classes = [names[i] for i in sorted(names.keys())]
         else:
             model_classes = list(names)
-        cfg = load_config()
-        cfg["model_path"] = model_path
-        save_config(cfg)
-        return jsonify({"ok": True, "model_classes": model_classes})
+        mid = 1
+        if STATE["models"]:
+            mid = max(m["id"] for m in STATE["models"]) + 1
+        entry = {
+            "id": mid,
+            "name": os.path.basename(model_path),
+            "path": model_path,
+            "model": model,
+            "model_classes": model_classes,
+            "cls_offset": int(data.get("cls_offset", 0) or 0),
+            "conf": float(data.get("conf", 0.25) or 0.25),
+            "only_cls": _parse_only_cls(data.get("only_cls")),
+        }
+        STATE["models"].append(entry)
+        _persist_model_meta()
+        return jsonify({"ok": True,
+                        "models": [_model_info(m) for m in STATE["models"]]})
     except Exception as e:
         return jsonify({"ok": False, "msg": f"加载失败: {e}"})
+
+
+@app.route("/api/update_model", methods=["POST"])
+def api_update_model():
+    data = request.get_json() or {}
+    try:
+        mid = int(data.get("id", -1))
+    except (TypeError, ValueError):
+        mid = -1
+    for m in STATE["models"]:
+        if m["id"] == mid:
+            if "cls_offset" in data:
+                m["cls_offset"] = int(data["cls_offset"] or 0)
+            if "conf" in data:
+                m["conf"] = float(data["conf"] or 0.25)
+            if "only_cls" in data:
+                m["only_cls"] = _parse_only_cls(data["only_cls"])
+            _persist_model_meta()
+            return jsonify({"ok": True,
+                            "models": [_model_info(x) for x in STATE["models"]]})
+    return jsonify({"ok": False, "msg": "模型不存在"})
+
+
+@app.route("/api/unload_model", methods=["POST"])
+def api_unload_model():
+    data = request.get_json() or {}
+    try:
+        mid = int(data.get("id", -1))
+    except (TypeError, ValueError):
+        mid = -1
+    STATE["models"] = [m for m in STATE["models"] if m["id"] != mid]
+    _persist_model_meta()
+    return jsonify({"ok": True,
+                    "models": [_model_info(m) for m in STATE["models"]]})
 
 
 @app.route("/api/image/<int:idx>")
@@ -252,19 +405,7 @@ def api_meta(idx):
     path = os.path.join(STATE["img_dir"], name)
     with Image.open(path) as im:
         w, h = im.size
-    boxes = []
-    lp = label_path_for(name)
-    if os.path.isfile(lp):
-        for line in open(lp, "r", encoding="utf-8", errors="ignore"):
-            line = line.strip()
-            if not line:
-                continue
-            p = line.split()
-            if len(p) < 5:
-                continue
-            boxes.append({"cls": int(float(p[0])),
-                          "cx": float(p[1]), "cy": float(p[2]),
-                          "w": float(p[3]), "h": float(p[4])})
+    boxes = _read_label_boxes(label_path_for(name))
     return jsonify({"ok": True, "name": name, "width": w, "height": h,
                     "boxes": boxes, "total": len(STATE["images"]), "idx": idx})
 
@@ -276,39 +417,12 @@ def api_save(idx):
     boxes = request.get_json().get("boxes", [])
     name = STATE["images"][idx]
     lp = label_path_for(name)
-    n_cls = len(STATE["classes"])
-    lines = []
-    errors = []
-    for i, b in enumerate(boxes, 1):
-        try:
-            cls = int(b["cls"])
-            cx = float(b["cx"])
-            cy = float(b["cy"])
-            w = float(b["w"])
-            h = float(b["h"])
-        except (KeyError, TypeError, ValueError):
-            errors.append(f"第{i}个框字段缺失或不是数字")
-            continue
-        errs = []
-        if n_cls and (cls < 0 or cls >= n_cls):
-            errs.append(f"类别 {cls} 超出范围 (0~{n_cls - 1})")
-        for k, v in (("cx", cx), ("cy", cy), ("w", w), ("h", h)):
-            if not math.isfinite(v) or not (0 <= v <= 1):
-                errs.append(f"{k}={v} 越界 (应为 0~1)")
-        if w <= 0 or h <= 0:
-            errs.append("宽高必须大于 0")
-        if errs:
-            errors.append(f"第{i}个框: " + "; ".join(errs))
-            continue
-        lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
+    lines, errors = _validate_boxes(boxes, len(STATE["classes"]))
     if errors:
         shown = errors[:10]
         msg = "；".join(shown) + ("…" if len(errors) > 10 else "")
         return jsonify({"ok": False, "msg": msg, "errors": errors})
-    with open(lp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-        if lines:
-            f.write("\n")
+    _write_label_file(lp, boxes)
     return jsonify({"ok": True, "count": len(lines), "done": len(lines) > 0})
 
 
@@ -327,26 +441,151 @@ def _parse_only_cls(raw):
 
 @app.route("/api/predict/<int:idx>", methods=["POST"])
 def api_predict(idx):
-    if STATE["model"] is None:
-        return jsonify({"ok": False, "msg": "未加载模型"})
+    if not STATE["models"]:
+        return jsonify({"ok": False, "msg": "未加载任何模型"})
     if idx < 0 or idx >= len(STATE["images"]):
         return jsonify({"ok": False})
     data = request.get_json() or {}
-    conf = float(data.get("conf", 0.25))
-    cls_offset = int(data.get("cls_offset", 0))
-    only_cls = _parse_only_cls(data.get("only_cls"))
+    iou_thr = float(data.get("iou", 0.5) or 0.5)
     path = os.path.join(STATE["img_dir"], STATE["images"][idx])
-    res = STATE["model"].predict(path, conf=conf, verbose=False)[0]
-    boxes = []
-    if res.boxes is not None:
-        for b in res.boxes:
-            model_cls = int(b.cls[0])
-            if only_cls is not None and model_cls not in only_cls:
-                continue
-            xc, yc, ww, hh = b.xywhn[0].tolist()
-            boxes.append({"cls": model_cls + cls_offset,
-                          "cx": xc, "cy": yc, "w": ww, "h": hh})
-    return jsonify({"ok": True, "boxes": boxes})
+    boxes, stats = _predict_all(path, iou_thr)
+    return jsonify({"ok": True, "boxes": boxes, "stats": stats})
+
+
+def _predict_all(path, iou_thr=0.5):
+    """用所有已加载模型预测,跨模型做类别内 NMS 去重。
+    返回 (boxes, stats); boxes 不含 conf。"""
+    n_cls = len(STATE["classes"])
+    collected = []
+    stats = []
+    for m in STATE["models"]:
+        try:
+            res = m["model"].predict(path, conf=m["conf"], verbose=False)[0]
+        except Exception as e:
+            stats.append({"name": m["name"], "raw": 0, "kept": 0,
+                          "error": str(e)})
+            continue
+        raw = 0
+        if res.boxes is not None:
+            for b in res.boxes:
+                model_cls = int(b.cls[0])
+                if m["only_cls"] is not None and model_cls not in m["only_cls"]:
+                    continue
+                raw += 1
+                xc, yc, ww, hh = b.xywhn[0].tolist()
+                cls = model_cls + m["cls_offset"]
+                if n_cls:
+                    cls = max(0, min(n_cls - 1, cls))
+                collected.append({"cls": cls, "cx": xc, "cy": yc,
+                                  "w": ww, "h": hh,
+                                  "conf": float(b.conf[0]),
+                                  "source": m["id"]})
+        stats.append({"name": m["name"], "raw": raw, "kept": 0,
+                      "error": None})
+    merged = _nms_boxes(collected, iou_thr)
+    kept_by_source = defaultdict(int)
+    for b in merged:
+        kept_by_source[b["source"]] += 1
+    for m, s in zip(STATE["models"], stats):
+        s["kept"] = kept_by_source.get(m["id"], 0)
+    out = [{"cls": b["cls"], "cx": b["cx"], "cy": b["cy"],
+            "w": b["w"], "h": b["h"]} for b in merged]
+    return out, stats
+
+
+def _nms_boxes(boxes, iou_thr):
+    """同类别内按置信度从高到低做 NMS;不同类别互不影响。"""
+    kept = []
+    by_cls = defaultdict(list)
+    for b in boxes:
+        by_cls[b["cls"]].append(b)
+    for cls, items in by_cls.items():
+        items.sort(key=lambda x: x.get("conf", 0), reverse=True)
+        for b in items:
+            if all(_iou_boxes(b, k) < iou_thr for k in kept
+                   if k["cls"] == cls):
+                kept.append(b)
+    return kept
+
+
+def _dedupe_with_existing(existing, preds, iou_thr):
+    """预测框与已有框做同类去重后合并。"""
+    out = [dict(b) for b in existing]
+    for p in preds:
+        if any(_iou_boxes(p, b) >= iou_thr for b in out
+               if b["cls"] == p["cls"]):
+            continue
+        out.append(p)
+    return out
+
+
+@app.route("/api/auto_annotate", methods=["POST"])
+def api_auto_annotate():
+    if not STATE["models"]:
+        return jsonify({"ok": False, "msg": "未加载任何模型"})
+    if not STATE["img_dir"]:
+        return jsonify({"ok": False, "msg": "请先打开图片文件夹"})
+    st = STATE.get("auto")
+    if st and st.get("running"):
+        return jsonify({"ok": False, "msg": "自动化标注已在运行中"})
+    data = request.get_json() or {}
+    skip_labeled = bool(data.get("skip_labeled", True))
+    iou_thr = float(data.get("iou", 0.5) or 0.5)
+    threading.Thread(target=_auto_worker,
+                     args=(skip_labeled, iou_thr), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+def _auto_worker(skip_labeled, iou_thr):
+    total = len(STATE["images"])
+    st = {"running": True, "finished": False, "cancel": False,
+          "total": total, "done": 0, "saved": 0, "skipped": 0,
+          "errors": [], "current": "", "percent": 0}
+    STATE["auto"] = st
+    try:
+        for i, name in enumerate(STATE["images"]):
+            if st["cancel"]:
+                break
+            st["current"] = name
+            st["done"] = i
+            st["percent"] = round(i / total * 100, 1) if total else 100
+            lp = label_path_for(name)
+            if skip_labeled and has_label(name):
+                st["skipped"] += 1
+            else:
+                try:
+                    path = os.path.join(STATE["img_dir"], name)
+                    preds, _ = _predict_all(path, iou_thr)
+                    existing = _read_label_boxes(lp)
+                    merged = _dedupe_with_existing(existing, preds, iou_thr)
+                    _write_label_file(lp, merged)
+                    st["saved"] += 1
+                except Exception as e:
+                    st["errors"].append(f"{name}: {e}")
+            st["done"] = i + 1
+            st["percent"] = round((i + 1) / total * 100, 1) if total else 100
+        st["running"] = False
+        st["finished"] = True
+    except Exception as e:
+        st["running"] = False
+        st["finished"] = True
+        st["errors"].append(str(e))
+
+
+@app.route("/api/auto_annotate_status")
+def api_auto_status():
+    return jsonify(STATE.get("auto") or {
+        "running": False, "finished": False, "cancel": False,
+        "total": 0, "done": 0, "saved": 0, "skipped": 0,
+        "errors": [], "current": "", "percent": 0})
+
+
+@app.route("/api/auto_cancel", methods=["POST"])
+def api_auto_cancel():
+    st = STATE.get("auto")
+    if st:
+        st["cancel"] = True
+    return jsonify({"ok": True})
 
 
 @app.route("/api/split", methods=["POST"])
@@ -483,6 +722,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .cls-btn.active{outline:2px solid #fff;}
   .cls-btn .sw{width:14px;height:14px;border-radius:4px;flex-shrink:0;}
   .cls-btn .key{margin-left:auto;font-size:11px;color:var(--muted);background:#0d0f14;padding:1px 6px;border-radius:4px;}
+  .model-card{border:1px solid var(--border);border-radius:10px;padding:10px;margin-top:8px;background:var(--panel2);}
+  .model-card .mc-top{display:flex;gap:6px;align-items:center;}
+  .model-card .mc-top input[type=text]{flex:1;}
+  .model-card .mc-opts{display:flex;gap:10px;margin-top:8px;}
+  .model-card .mc-opts>div{flex:1;}
+  .model-card .mc-opts label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px;}
+  .model-card .mc-opts input{width:100%;}
+  .model-card .mc-status{font-size:11px;color:var(--muted);margin-top:6px;word-break:break-all;}
+  .model-card .mc-cls{max-height:140px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:6px;margin-top:8px;}
+  .model-card .mc-cls label{display:flex;align-items:center;gap:8px;padding:4px 6px;font-size:12px;cursor:pointer;border-radius:6px;}
+  .model-card .mc-cls label:hover{background:#2a3140;}
   #boxList{max-height:240px;overflow-y:auto;}
   .box-item{display:flex;align-items:center;gap:6px;padding:6px;margin:3px 0;background:var(--panel2);border-radius:6px;font-size:12px;}
   .box-item.sel{outline:2px solid #fff;}
@@ -512,7 +762,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--muted)">v0.3</span></div>
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--muted)">v0.4</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--muted);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">⚙ 配置</button>
   <button class="tbtn" id="btnSplit" onclick="openSplit()" disabled>📂 划分数据集</button>
@@ -522,6 +772,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="tbtn" id="btnNext" onclick="go(1)" disabled>下一张 ▶</button>
   <div class="spacer"></div>
   <button class="tbtn green" id="btnPredict" onclick="predict()" disabled>✨ 模型预测</button>
+  <button class="tbtn" id="btnAuto" onclick="openAuto()" disabled>🤖 自动化标注</button>
   <button class="tbtn" id="btnClear" onclick="clearBoxes()" disabled>清空</button>
   <button class="tbtn primary" id="btnSave" onclick="saveLabels()" disabled>💾 保存</button>
 </div>
@@ -581,33 +832,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="grp">
-      <div class="gt">② 模型辅助标注 (可选)</div>
-      <div class="field">
-        <label>模型权重路径 (.pt)</label>
-        <input id="modelPath" type="text" placeholder="如 ...\weights\best.pt">
-      </div>
+      <div class="gt">② 模型辅助标注 (可加载多个，预测时合并)</div>
+      <div id="modelCards"></div>
+      <button class="tbtn" style="margin-top:8px" onclick="addModelCard()">+ 添加模型</button>
       <div class="inline">
         <div class="field">
-          <label>类别偏移</label>
-          <input id="clsOffset" type="number" value="0">
-        </div>
-        <div class="field">
-          <label>置信度阈值</label>
-          <input id="confIn" type="number" step="0.05" value="0.25">
+          <label>全局去重 IoU 阈值</label>
+          <input id="iouThr" type="number" step="0.05" min="0" max="1" value="0.5">
         </div>
       </div>
-      <div class="hint">模型类别ID + 偏移 = 标注类别ID。例：模型 helmet=0,no-helmet=1 对应标注 0/1，偏移填 0</div>
-      <button class="tbtn" style="margin-top:8px" onclick="loadModel()">加载模型</button>
-      <div id="modelMsg"></div>
-      <div class="field" id="modelClsBox" style="display:none">
-        <label>只标注以下模型类别</label>
-        <div id="modelClsList" style="max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:6px;"></div>
-        <div style="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-          <button class="tbtn" style="padding:4px 10px;font-size:11px" onclick="setModelClsAll(true)">全选</button>
-          <button class="tbtn" style="padding:4px 10px;font-size:11px" onclick="setModelClsAll(false)">全不选</button>
-          <span class="hint">未勾选的类别，预测时会被过滤掉；全部不勾选 = 不输出任何框</span>
-        </div>
-      </div>
+      <div class="hint">每个模型可单独设类别偏移和置信度；同类别重叠框按置信度只保留一个，不同类别同时保留（如安全帽 + 反光衣）。</div>
     </div>
 
     <div class="actions">
@@ -660,12 +894,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- 自动化标注弹窗 -->
+<div id="autoMask" style="position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:100;">
+  <div class="modal" style="width:480px;">
+    <h2>🤖 自动化标注</h2>
+    <div class="sub">批量运行已加载的模型预测，自动去重后直接保存标注</div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input id="autoSkip" type="checkbox" style="width:auto" checked> 仅标注未标注的图片
+      </label>
+    </div>
+    <div class="field">
+      <label>去重 IoU 阈值</label>
+      <input id="autoIou" type="number" step="0.05" min="0" max="1" value="0.5">
+    </div>
+    <div style="background:var(--bg);border-radius:8px;height:16px;overflow:hidden;margin:14px 0;">
+      <div id="autoBar" style="height:100%;width:0%;background:var(--accent);transition:width .3s;"></div>
+    </div>
+    <div id="autoMsg" style="font-size:12px;color:var(--muted);min-height:60px;white-space:pre-wrap;"></div>
+    <div class="actions">
+      <button class="tbtn" id="autoCancelBtn" onclick="cancelAuto()" disabled>取消</button>
+      <button class="tbtn primary" id="autoStartBtn" onclick="startAuto()">开始自动化标注</button>
+    </div>
+  </div>
+</div>
+
 <script>
 let idx=0,total=0,imgW=0,imgH=0,scale=1,baseScale=1,offX=0,offY=0;
 let boxes=[],classes=[],curCls=0,selIdx=-1,files=[];
 let drawing=false,sx=0,sy=0,ex=0,ey=0;
 let panning=false,panX=0,panY=0;
-let modelSelCls=null;
+let modelSlots=[];
+let modelKeySeq=1;
+let autoTimer=null;
 let dirty=false;
 let undoStack=[],redoStack=[];
 let moving=false,resizing=false,resizeHandle=null;
@@ -709,7 +970,7 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   if(c.img_dir)document.getElementById('imgDir').value=c.img_dir;
   if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
   if(c.classes)document.getElementById('classesIn').value=c.classes;
-  if(c.model_path)document.getElementById('modelPath').value=c.model_path;
+  initModelSlots(c.models||[]);
   openModal();
 });
 
@@ -725,53 +986,145 @@ function openFolder(){
     const cf=document.getElementById('curFolder');
     if(cf){cf.textContent='📁 '+(d.img_dir||'');cf.title=d.img_dir||'';}
     closeModal();
-    ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnSplit'].forEach(id=>document.getElementById(id).disabled=false);
+    ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto','btnSplit'].forEach(id=>document.getElementById(id).disabled=false);
     buildClsBtns();buildFileList();load(0);
   });
 }
 
-function loadModel(){
-  const model_path=document.getElementById('modelPath').value;
-  const m=document.getElementById('modelMsg');
-  m.style.color='#8b93a4';m.textContent='加载中...';
-  fetch('/api/load_model',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({model_path})}).then(r=>r.json()).then(d=>{
-    if(!d.ok){m.style.color='#ef4444';m.textContent='✗ '+d.msg;return;}
-    m.style.color='#22c55e';m.textContent='✓ 已加载，模型类别: '+d.model_classes.join(', ');
-    buildModelClsSel(d.model_classes);
+function newModelSlot(){
+  return {key:modelKeySeq++,id:null,path:'',cls_offset:0,conf:0.25,
+          only_cls:null,model_classes:[]};
+}
+function initModelSlots(saved){
+  modelSlots=[];
+  (saved||[]).forEach(m=>{
+    modelSlots.push({key:modelKeySeq++,id:null,path:m.path||'',
+      cls_offset:m.cls_offset||0,conf:m.conf||0.25,
+      only_cls:m.only_cls?m.only_cls.slice():null,model_classes:[]});
+  });
+  if(!modelSlots.length)modelSlots.push(newModelSlot());
+  renderModelCards();
+  fetch('/api/models').then(r=>r.json()).then(d=>{
+    if(d.ok&&d.models)applyServerModels(d.models,true);
   });
 }
-
-function buildModelClsSel(model_classes){
-  const box=document.getElementById('modelClsList');
+function applyServerModels(list,quiet){
+  const paths=list.map(m=>m.path);
+  modelSlots.forEach(s=>{
+    if(s.path&&!paths.includes(s.path)){
+      s.id=null;s.model_classes=[];s.only_cls=null;
+    }
+  });
+  list.forEach(m=>{
+    let s=modelSlots.find(x=>x.path===m.path);
+    if(!s){
+      s=newModelSlot();s.path=m.path;modelSlots.push(s);
+    }
+    s.id=m.id;s.model_classes=m.model_classes;
+    s.cls_offset=m.cls_offset;s.conf=m.conf;s.only_cls=m.only_cls;
+  });
+  renderModelCards();
+}
+function addModelCard(){modelSlots.push(newModelSlot());renderModelCards();}
+function renderModelCards(){
+  const box=document.getElementById('modelCards');
   box.innerHTML='';
-  modelSelCls=null;
-  model_classes.forEach((name,i)=>{
-    const lab=document.createElement('label');
-    lab.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 6px;font-size:12px;cursor:pointer;border-radius:6px;';
-    lab.addEventListener('mouseenter',()=>lab.style.background='#2a3140');
-    lab.addEventListener('mouseleave',()=>lab.style.background='transparent');
-    const cb=document.createElement('input');
-    cb.type='checkbox';cb.checked=true;cb.value=i;
-    cb.addEventListener('change',collectModelSel);
-    const span=document.createElement('span');
-    span.textContent=i+': '+name;
-    lab.appendChild(cb);lab.appendChild(span);
-    box.appendChild(lab);
-  });
-  document.getElementById('modelClsBox').style.display='block';
+  modelSlots.forEach(s=>box.appendChild(buildModelCard(s)));
 }
-
-function collectModelSel(){
-  const cbs=document.querySelectorAll('#modelClsList input[type=checkbox]');
+function buildModelCard(s){
+  const card=document.createElement('div');
+  card.className='model-card';card.dataset.key=s.key;
+  const top=document.createElement('div');top.className='mc-top';
+  const path=document.createElement('input');path.type='text';
+  path.value=s.path;path.placeholder='如 ...\\weights\\best.pt';
+  if(s.id)path.readOnly=true;
+  top.appendChild(path);
+  const loadBtn=document.createElement('button');
+  loadBtn.className='tbtn';loadBtn.textContent=s.id?'已加载':'加载模型';
+  loadBtn.disabled=!!s.id;
+  loadBtn.onclick=()=>loadModelSlot(s.key);
+  top.appendChild(loadBtn);
+  const delBtn=document.createElement('button');
+  delBtn.className='tbtn';delBtn.textContent='✕';delBtn.title='移除该模型';
+  delBtn.onclick=()=>removeModelSlot(s.key);
+  top.appendChild(delBtn);
+  card.appendChild(top);
+  const opts=document.createElement('div');opts.className='mc-opts';
+  const offWrap=document.createElement('div');
+  const offLb=document.createElement('label');offLb.textContent='类别偏移';
+  const off=document.createElement('input');off.type='number';off.value=s.cls_offset;
+  off.onchange=()=>{s.cls_offset=parseInt(off.value)||0;if(s.id)updateModelSlot(s.key,{cls_offset:s.cls_offset});};
+  offWrap.appendChild(offLb);offWrap.appendChild(off);
+  const cfWrap=document.createElement('div');
+  const cfLb=document.createElement('label');cfLb.textContent='置信度阈值';
+  const cf=document.createElement('input');cf.type='number';cf.step='0.05';cf.value=s.conf;
+  cf.onchange=()=>{s.conf=parseFloat(cf.value)||0.25;if(s.id)updateModelSlot(s.key,{conf:s.conf});};
+  cfWrap.appendChild(cfLb);cfWrap.appendChild(cf);
+  opts.appendChild(offWrap);opts.appendChild(cfWrap);
+  card.appendChild(opts);
+  const status=document.createElement('div');status.className='mc-status';
+  if(s.id)status.textContent='✓ 模型类别: '+s.model_classes.join(', ');
+  card.appendChild(status);
+  if(s.id){
+    const clsBox=document.createElement('div');clsBox.className='mc-cls';
+    s.model_classes.forEach((name,i)=>{
+      const lab=document.createElement('label');
+      const cb=document.createElement('input');cb.type='checkbox';
+      cb.checked=!(s.only_cls)||s.only_cls.includes(i);cb.value=i;
+      cb.onchange=()=>{collectSlotCls(s);updateModelSlot(s.key,{only_cls:s.only_cls});};
+      const sp=document.createElement('span');sp.textContent=i+': '+name;
+      lab.appendChild(cb);lab.appendChild(sp);clsBox.appendChild(lab);
+    });
+    const btnRow=document.createElement('div');
+    btnRow.style.cssText='margin-top:6px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;';
+    const allBtn=document.createElement('button');allBtn.className='tbtn';
+    allBtn.style.cssText='padding:3px 10px;font-size:11px;';allBtn.textContent='全选';
+    allBtn.onclick=()=>{clsBox.querySelectorAll('input[type=checkbox]').forEach(c=>c.checked=true);collectSlotCls(s);updateModelSlot(s.key,{only_cls:s.only_cls});};
+    const noneBtn=document.createElement('button');noneBtn.className='tbtn';
+    noneBtn.style.cssText='padding:3px 10px;font-size:11px;';noneBtn.textContent='全不选';
+    noneBtn.onclick=()=>{clsBox.querySelectorAll('input[type=checkbox]').forEach(c=>c.checked=false);collectSlotCls(s);updateModelSlot(s.key,{only_cls:s.only_cls});};
+    const hint=document.createElement('span');hint.className='hint';
+    hint.textContent='未勾选的类别预测时会被过滤；全不勾选 = 不输出任何框';
+    btnRow.appendChild(allBtn);btnRow.appendChild(noneBtn);btnRow.appendChild(hint);
+    card.appendChild(clsBox);card.appendChild(btnRow);
+  }
+  return card;
+}
+function collectSlotCls(s){
+  const card=document.querySelector('.model-card[data-key="'+s.key+'"]');
+  const cbs=card?card.querySelectorAll('.mc-cls input[type=checkbox]'):[];
   const sel=[];
   cbs.forEach(cb=>{if(cb.checked)sel.push(parseInt(cb.value));});
-  modelSelCls=sel;
+  s.only_cls=sel;
 }
-
-function setModelClsAll(on){
-  document.querySelectorAll('#modelClsList input[type=checkbox]').forEach(cb=>cb.checked=on);
-  collectModelSel();
+function loadModelSlot(key){
+  const s=modelSlots.find(x=>x.key===key);
+  if(!s||!s.path.trim()){alert('请先填写模型路径');return;}
+  fetch('/api/load_model',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({model_path:s.path.trim(),cls_offset:s.cls_offset,conf:s.conf})}).then(r=>r.json()).then(d=>{
+    if(!d.ok){alert('加载失败: '+(d.msg||'未知错误'));return;}
+    applyServerModels(d.models);
+  });
+}
+function updateModelSlot(key,patch){
+  const s=modelSlots.find(x=>x.key===key);
+  if(!s||!s.id)return;
+  fetch('/api/update_model',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(Object.assign({id:s.id},patch))}).then(r=>r.json()).then(d=>{
+    if(d.ok)applyServerModels(d.models);
+  });
+}
+function removeModelSlot(key){
+  const s=modelSlots.find(x=>x.key===key);
+  if(!s)return;
+  if(s.id){
+    fetch('/api/unload_model',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:s.id})}).then(r=>r.json()).then(d=>{
+      if(d.ok)applyServerModels(d.models);
+    });
+  }
+  modelSlots=modelSlots.filter(x=>x.key!==key);
+  renderModelCards();
 }
 
 function buildClsBtns(){
@@ -1018,27 +1371,28 @@ function iou(a,b){
   const union=((ax2-ax1)*(ay2-ay1))+((bx2-bx1)*(by2-by1))-inter;
   return union>0?inter/union:0;
 }
-function dedupeAppend(newBoxes){
+function dedupeAppend(newBoxes,iouThr){
+  iouThr=iouThr||0.5;
   const out=[];
   newBoxes.forEach(nb=>{
     let dup=false;
-    for(const ob of boxes){if(ob.cls===nb.cls&&iou(ob,nb)>=0.5){dup=true;break;}}
-    if(!dup){for(const ob of out){if(ob.cls===nb.cls&&iou(ob,nb)>=0.5){dup=true;break;}}}
+    for(const ob of boxes){if(ob.cls===nb.cls&&iou(ob,nb)>=iouThr){dup=true;break;}}
+    if(!dup){for(const ob of out){if(ob.cls===nb.cls&&iou(ob,nb)>=iouThr){dup=true;break;}}}
     if(!dup)out.push(nb);
   });
   return out;
 }
 function predict(){
-  const conf=parseFloat(document.getElementById('confIn').value)||0.25;
-  const cls_offset=parseInt(document.getElementById('clsOffset').value)||0;
+  if(!modelSlots.some(s=>s.id)){st('请先在配置中加载模型');return;}
+  const iou=parseFloat(document.getElementById('iouThr').value)||0.5;
   st('模型预测中...');
   fetch('/api/predict/'+idx,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({conf,cls_offset,only_cls:modelSelCls})}).then(r=>r.json()).then(d=>{
+    body:JSON.stringify({iou})}).then(r=>r.json()).then(d=>{
     if(!d.ok){st('预测失败: '+(d.msg||''));return;}
     // 过滤模型可能输出的退化框(宽高<=0/非数字),避免出现"看不见、点不中、存不了"的框
     const validBoxes=d.boxes.filter(b=>b&&isFinite(b.cx)&&isFinite(b.cy)&&b.w>0&&b.h>0);
     const badCount=d.boxes.length-validBoxes.length;
-    const added=dedupeAppend(validBoxes);
+    const added=dedupeAppend(validBoxes,iou);
     let warn='';
     if(classes.length){
       let clsBad=0;
@@ -1051,8 +1405,8 @@ function predict(){
       if(clsBad)warn='，其中 '+clsBad+' 个框类别超出范围已自动归到合法类别，请检查类别偏移';
     }
     if(added.length){snap();boxes.push(...added);markDirty();}
-    st('✨ 模型检测 '+d.boxes.length+' 个框，新增 '+added.length+' 个 (去重 '+
-       (d.boxes.length-added.length)+' 个，过滤退化框 '+badCount+' 个)'+warn);
+    const stats=(d.stats||[]).map(s=>s.name+': '+s.raw+'→'+s.kept).join(' / ');
+    st('✨ '+stats+' 合并新增 '+added.length+' 个 (过滤退化框 '+badCount+' 个)'+warn);
     redraw();
   });
 }
@@ -1092,9 +1446,64 @@ function doSplit(){
   }).catch(e=>{btn.disabled=false;msg.style.color='#ef4444';msg.textContent='✗ '+e;});
 }
 
+function openAuto(){
+  if(!modelSlots.some(s=>s.id)){alert('请先在配置中加载至少一个模型');return;}
+  document.getElementById('autoIou').value=document.getElementById('iouThr').value;
+  document.getElementById('autoBar').style.width='0%';
+  document.getElementById('autoMsg').textContent='';
+  document.getElementById('autoStartBtn').disabled=false;
+  document.getElementById('autoCancelBtn').disabled=true;
+  document.getElementById('autoMask').style.display='flex';
+}
+function startAuto(){
+  saveLabels(true);
+  const skip=document.getElementById('autoSkip').checked;
+  const iou=parseFloat(document.getElementById('autoIou').value)||0.5;
+  const btn=document.getElementById('autoStartBtn');
+  btn.disabled=true;
+  document.getElementById('autoCancelBtn').disabled=false;
+  document.getElementById('autoMsg').textContent='准备中...';
+  fetch('/api/auto_annotate',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({skip_labeled:skip,iou})}).then(r=>r.json()).then(d=>{
+    if(!d.ok){alert(d.msg);btn.disabled=false;document.getElementById('autoCancelBtn').disabled=true;return;}
+    pollAuto();
+  });
+}
+function pollAuto(){
+  fetch('/api/auto_annotate_status').then(r=>r.json()).then(d=>{
+    document.getElementById('autoBar').style.width=(d.percent||0)+'%';
+    const errs=d.errors||[];
+    let msg='进度: '+d.done+' / '+d.total+' ('+(d.percent||0)+'%)\n'+
+            '当前: '+(d.current||'')+'\n'+
+            '已标注: '+d.saved+'  跳过: '+d.skipped;
+    if(errs.length)msg+='\n错误 '+errs.length+' 个: '+errs.slice(0,3).join(' | ');
+    document.getElementById('autoMsg').textContent=msg;
+    if(d.running){
+      autoTimer=setTimeout(pollAuto,700);
+    }else{
+      document.getElementById('autoStartBtn').disabled=false;
+      document.getElementById('autoCancelBtn').disabled=true;
+      if(d.finished){
+        st('✓ 自动化标注完成: 新增 '+d.saved+' 张, 跳过 '+d.skipped+' 张');
+        refreshAfterAuto();
+      }
+    }
+  });
+}
+function cancelAuto(){
+  fetch('/api/auto_cancel',{method:'POST'}).then(()=>{});
+}
+function refreshAfterAuto(){
+  fetch('/api/files').then(r=>r.json()).then(d=>{
+    if(d.ok){files=d.files;buildFileList();}
+  });
+  load(idx);
+}
+
 document.addEventListener('keydown',e=>{
   if(document.getElementById('modalMask').style.display==='flex')return;
   if(document.getElementById('splitMask').style.display==='flex')return;
+  if(document.getElementById('autoMask').style.display==='flex')return;
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
   if(e.ctrlKey||e.metaKey){
     if(e.key.toLowerCase()==='z'){e.preventDefault();if(e.shiftKey)redo();else undo();}
