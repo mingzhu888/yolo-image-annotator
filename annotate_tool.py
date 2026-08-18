@@ -126,8 +126,6 @@ STATE = {
     "label_dir": None,
     "images": [],
     "classes": [],
-    "exclusive_groups": [],   # 互斥类别组 [["Belt_off","Belt_on"], ...]
-    "allow_multi_cls": False, # 是否允许同一目标保留多个不同类别
     "models": [],        # 已加载的模型列表 [{id,name,path,model,model_classes,cls_offset,conf,only_cls}]
     "auto": None,        # 自动化标注进度
 }
@@ -206,59 +204,6 @@ def _same_target(a, b, iou_thr):
     in_y = (big["cy"] - big["h"] / 2 <= small["cy"] <=
             big["cy"] + big["h"] / 2)
     return in_x and in_y
-
-
-def _parse_exclusive_groups(raw):
-    """把 'A,B;C,D' 解析成 [['A','B'],['C','D']]。"""
-    groups = []
-    if not raw:
-        return groups
-    parts = str(raw).replace("，", ",").split(";")
-    for part in parts:
-        names = [x.strip() for x in part.split(",") if x.strip()]
-        if len(names) >= 2:
-            groups.append(names)
-    return groups
-
-
-def _exclusive_group_ids(groups, classes):
-    """把互斥类别名映射成类别 ID 集合列表。"""
-    id_map = {c: i for i, c in enumerate(classes)}
-    out = []
-    for g in groups:
-        ids = [id_map[n] for n in g if n in id_map]
-        if len(ids) >= 2:
-            out.append(set(ids))
-    return out
-
-
-def _resolve_exclusive(boxes, excl_ids, iou_thr):
-    """互斥类别组内,同一目标只保留置信度最高的一个。
-    boxes 需要带 conf 字段;同类别去重由 NMS 负责。"""
-    if not excl_ids:
-        return boxes
-    kept = []
-    ordered = sorted(boxes, key=lambda x: x.get("conf", 0), reverse=True)
-    for b in ordered:
-        conflict = False
-        for k in kept:
-            if k["cls"] == b["cls"]:
-                continue
-            same_group = any(b["cls"] in g and k["cls"] in g for g in excl_ids)
-            if same_group and _same_target(b, k, iou_thr):
-                conflict = True
-                break
-        if not conflict:
-            kept.append(b)
-    return kept
-
-
-def _current_excl_ids():
-    """默认: 同一目标只保留置信度最高的类别(所有类别视为互斥)。
-    开启 allow_multi_cls 后,只对显式声明的互斥组生效。"""
-    if not STATE.get("allow_multi_cls") and STATE["classes"]:
-        return [set(range(len(STATE["classes"])))]
-    return _exclusive_group_ids(STATE["exclusive_groups"], STATE["classes"])
 
 
 def _validate_boxes(boxes, n_cls):
@@ -349,15 +294,10 @@ def api_open():
     STATE["label_dir"] = label_dir
     STATE["images"] = imgs
     STATE["classes"] = classes if classes else STATE["classes"]
-    STATE["exclusive_groups"] = _parse_exclusive_groups(
-        data.get("exclusive_groups", ""))
-    STATE["allow_multi_cls"] = bool(data.get("allow_multi_cls", False))
 
     cfg = load_config()
     cfg.update({"img_dir": img_dir, "label_dir": label_dir,
-                "classes": ",".join(STATE["classes"]),
-                "exclusive_groups": str(data.get("exclusive_groups", "")).strip(),
-                "allow_multi_cls": STATE["allow_multi_cls"]})
+                "classes": ",".join(STATE["classes"])})
     save_config(cfg)
 
     file_status = [{"name": n, "done": has_label(n)} for n in imgs]
@@ -736,9 +676,8 @@ def api_predict(idx):
     data = request.get_json() or {}
     iou_thr = float(data.get("iou", 0.5) or 0.5)
     path = os.path.join(STATE["img_dir"], STATE["images"][idx])
-    boxes, stats, excl_dropped = _predict_all(path, iou_thr)
-    return jsonify({"ok": True, "boxes": boxes, "stats": stats,
-                    "excl_dropped": excl_dropped})
+    boxes, stats = _predict_all(path, iou_thr)
+    return jsonify({"ok": True, "boxes": boxes, "stats": stats})
 
 
 def _predict_all(path, iou_thr=0.5):
@@ -790,19 +729,14 @@ def _predict_all(path, iou_thr=0.5):
         stats.append({"name": m["name"], "raw": raw, "kept": 0,
                       "error": None})
     merged = _nms_boxes(collected, iou_thr)
-    n_after_nms = len(merged)
-    excl_ids = _current_excl_ids()
-    merged = _resolve_exclusive(merged, excl_ids, iou_thr)
-    excl_dropped = n_after_nms - len(merged)
     kept_by_source = defaultdict(int)
     for b in merged:
         kept_by_source[b["source"]] += 1
     for m, s in zip(STATE["models"], stats):
         s["kept"] = kept_by_source.get(m["id"], 0)
     out = [{"cls": b["cls"], "cx": b["cx"], "cy": b["cy"],
-            "w": b["w"], "h": b["h"], "conf": b.get("conf", 1.0)}
-           for b in merged]
-    return out, stats, excl_dropped
+            "w": b["w"], "h": b["h"]} for b in merged]
+    return out, stats
 
 
 def _nms_boxes(boxes, iou_thr):
@@ -867,12 +801,9 @@ def _auto_worker(skip_labeled, iou_thr):
             else:
                 try:
                     path = os.path.join(STATE["img_dir"], name)
-                    preds, _, _ = _predict_all(path, iou_thr)
-                    existing = [dict(b, conf=1.0)
-                                for b in _read_label_boxes(lp)]
+                    preds, _ = _predict_all(path, iou_thr)
+                    existing = _read_label_boxes(lp)
                     merged = _dedupe_with_existing(existing, preds, iou_thr)
-                    excl_ids = _current_excl_ids()
-                    merged = _resolve_exclusive(merged, excl_ids, iou_thr)
                     _write_label_file(lp, merged)
                     st["saved"] += 1
                 except Exception as e:
@@ -1123,7 +1054,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v0.9</span></div>
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v1.0</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">配置</button>
   <button class="tbtn ghost" id="themeBtn" onclick="toggleTheme()" title="切换深色 / 浅色">浅色</button>
@@ -1196,12 +1127,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <label>类别 (英文，逗号分隔，顺序即为类别ID)</label>
         <input id="classesIn" type="text" placeholder="如 acetylene_cylinder,oxygen_cylinder">
         <div class="hint">第1个=0, 第2个=1 ... 建议用英文，避免训练时中文路径问题</div>
-      </div>
-      <div class="field">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-          <input id="allowMultiCls" type="checkbox" style="width:auto;"> 同一目标允许多个类别同时保留（如安全帽 + 反光衣）
-        </label>
-        <div class="hint">默认不勾选：同一目标上多个类别只保留置信度最高的（如 Belt_off / Belt_on 不会同时出现）。勾选后，同一目标上的不同类别都会保留。</div>
       </div>
     </div>
 
@@ -1300,7 +1225,6 @@ let drawing=false,sx=0,sy=0,ex=0,ey=0;
 let panning=false,panX=0,panY=0;
 let modelSlots=[];
 let modelKeySeq=1;
-let allowMultiCls=false;
 let autoTimer=null;
 let autoActive=false;
 let predicting=false;
@@ -1398,7 +1322,6 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   if(c.img_dir)document.getElementById('imgDir').value=c.img_dir;
   if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
   if(c.classes)document.getElementById('classesIn').value=c.classes;
-  if(c.allow_multi_cls)document.getElementById('allowMultiCls').checked=true;
   initModelSlots(c.models||[]);
   openModal();
 });
@@ -1408,9 +1331,8 @@ function openFolder(){
   const label_dir=document.getElementById('labelDir').value;
   classes=document.getElementById('classesIn').value.split(',').map(s=>s.trim()).filter(s=>s);
   if(!classes.length){alert('请至少填写一个类别');return;}
-  allowMultiCls=document.getElementById('allowMultiCls').checked;
   fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({img_dir,label_dir,classes,allow_multi_cls:allowMultiCls})}).then(r=>r.json()).then(d=>{
+    body:JSON.stringify({img_dir,label_dir,classes})}).then(r=>r.json()).then(d=>{
     if(!d.ok){alert(d.msg);return;}
     total=d.count;idx=0;files=d.files;
     const cf=document.getElementById('curFolder');
@@ -1858,11 +1780,9 @@ function dedupeAppend(newBoxes,iouThr){
     let dup=false;
     for(const ob of boxes){
       if(ob.cls===nb.cls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
-      if(!allowMultiCls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
     }
     if(!dup){for(const ob of out){
       if(ob.cls===nb.cls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
-      if(!allowMultiCls&&sameTarget(ob,nb,iouThr)){dup=true;break;}
     }}
     if(!dup)out.push(nb);
   });
@@ -1898,8 +1818,7 @@ function predict(){
     if(added.length){snap();boxes.push(...added);markDirty();}
     const stats=(d.stats||[]).map(s=>s.error? s.name+': 失败('+s.error+')'
                                               : s.name+': '+s.raw+'→'+s.kept).join(' / ');
-    const exclTxt=d.excl_dropped? ' 互斥过滤 '+d.excl_dropped+' 个':'';
-    st('预测合并: '+stats+' 新增 '+added.length+' 个 (过滤退化框 '+badCount+' 个)'+exclTxt+warn);
+    st('预测合并: '+stats+' 新增 '+added.length+' 个 (过滤退化框 '+badCount+' 个)'+warn);
     redraw();
   }).catch(()=>{
     predicting=false;

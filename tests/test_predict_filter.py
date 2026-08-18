@@ -74,8 +74,6 @@ def _set_state(tmp, models):
     at.STATE["label_dir"] = tmp
     at.STATE["images"] = ["a.jpg"]
     at.STATE["classes"] = ["belt_off", "belt_on"]
-    at.STATE["exclusive_groups"] = []
-    at.STATE["allow_multi_cls"] = False
     at.STATE["models"] = models
     at.STATE["auto"] = None
     Image.new("RGB", (100, 80), "white").save(os.path.join(tmp, "a.jpg"))
@@ -130,59 +128,10 @@ def test_nms_keeps_different_classes():
         # 同一个目标上的不同类别(如安全帽 + 反光衣)必须同时保留
         _set_state(tmp, [_entry(1, [(0, 0.9)]),
                          _entry(2, [(1, 0.9)])])
-        at.STATE["allow_multi_cls"] = True
         d = _predict()
         assert d["ok"]
         assert len(d["boxes"]) == 2
         assert {b["cls"] for b in d["boxes"]} == {0, 1}
-
-
-def test_default_keeps_highest_conf_cross_class():
-    with tempfile.TemporaryDirectory() as tmp:
-        # 默认(不勾选"允许多类别"): 同一目标 Belt_off(0.9) 和 Belt_on(0.8) 只保留 0.9
-        m1 = _entry(1, [])
-        m1["model"] = _BoxModel([(0, 0.9, 0.25, 0.25, 0.4, 0.4)])
-        m2 = _entry(2, [])
-        m2["model"] = _BoxModel([(1, 0.8, 0.25, 0.25, 0.4, 0.4)])
-        _set_state(tmp, [m1, m2])
-        d = _predict()
-        assert d["ok"]
-        assert len(d["boxes"]) == 1
-        assert d["boxes"][0]["cls"] == 0
-        assert d["excl_dropped"] == 1
-
-
-def test_exclusive_groups_keep_highest_conf():
-    with tempfile.TemporaryDirectory() as tmp:
-        # 互斥组内同一目标同时检出 Belt_off(0.9) 和 Belt_on(0.8)
-        # 只保留置信度高的,并报告互斥过滤数量
-        m1 = _entry(1, [])
-        m1["model"] = _BoxModel([(0, 0.9, 0.25, 0.25, 0.4, 0.4)])
-        m2 = _entry(2, [])
-        m2["model"] = _BoxModel([(1, 0.8, 0.25, 0.25, 0.4, 0.4)])
-        _set_state(tmp, [m1, m2])
-        at.STATE["exclusive_groups"] = [["belt_off", "belt_on"]]
-        at.STATE["allow_multi_cls"] = True  # 显式互斥组在"允许多类别"下仍生效
-        d = _predict()
-        assert d["ok"]
-        assert len(d["boxes"]) == 1
-        assert d["boxes"][0]["cls"] == 0
-        assert d["excl_dropped"] == 1
-
-
-def test_exclusive_groups_keep_separate_targets():
-    with tempfile.TemporaryDirectory() as tmp:
-        # 两个不同位置的目标: 一个 Belt_off, 一个 Belt_on, 都应保留
-        m1 = _entry(1, [])
-        m1["model"] = _BoxModel([(0, 0.9, 0.25, 0.5, 0.2, 0.2)])
-        m2 = _entry(2, [])
-        m2["model"] = _BoxModel([(1, 0.8, 0.75, 0.5, 0.2, 0.2)])
-        _set_state(tmp, [m1, m2])
-        at.STATE["exclusive_groups"] = [["belt_off", "belt_on"]]
-        d = _predict()
-        assert d["ok"]
-        assert len(d["boxes"]) == 2
-        assert d["excl_dropped"] == 0
 
 
 def test_nms_merges_contained_boxes():
@@ -250,9 +199,6 @@ if __name__ == "__main__":
     test_filter_empty_keeps_nothing()
     test_nms_merges_duplicates_across_models()
     test_nms_keeps_different_classes()
-    test_default_keeps_highest_conf_cross_class()
-    test_exclusive_groups_keep_highest_conf()
-    test_exclusive_groups_keep_separate_targets()
     test_nms_merges_contained_boxes()
     test_duplicate_path_rejected()
     test_suggest_offset()

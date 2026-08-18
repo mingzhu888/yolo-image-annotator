@@ -63,8 +63,6 @@ def _set_state(tmp, models, labeled_a=True):
     at.STATE["label_dir"] = tmp
     at.STATE["images"] = ["a.jpg", "b.jpg"]
     at.STATE["classes"] = ["belt_off", "belt_on"]
-    at.STATE["exclusive_groups"] = []
-    at.STATE["allow_multi_cls"] = False
     at.STATE["models"] = models
     at.STATE["auto"] = None
     for n in ("a.jpg", "b.jpg"):
