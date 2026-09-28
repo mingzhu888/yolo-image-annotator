@@ -38,6 +38,16 @@
 - 预测去重：与已有框同类别且 IoU 超过阈值自动去重，并过滤退化框
 - 未安装模型依赖时，加载模型会给出明确的安装提示
 
+**支持的权重格式：**
+
+| 格式 | 说明 |
+|---|---|
+| Ultralytics `.pt`（YOLOv8 / v11 / v26 …） | 需要 `ultralytics` |
+| **YOLOv5 `.pt`（v5 / v6 / v7 系）** | **不需要 ultralytics，也不需要 yolov5 仓库** |
+| 美团 YOLOv6n checkpoint | 需要 `YOLOV6_REPO` 或配置里的 `v6n_repo` 指向 YOLOv6 源码 |
+
+关于 YOLOv5：它的 `.pt` 是**带类定义的 pickle**，里面直接引用了 yolov5 仓库的顶层模块 `models.*`，所以用别的方式加载会报 `No module named 'models'`。本工具在内存里自带了一套 `models` 兼容层（`models.common` / `models.yolo` / `models.experimental`），按官方 v7 公式自己做解码和 NMS，**直接加载即可**。
+
 ### 自动化标注
 
 模型性能足够时，可以整目录批量自动标注，不用一张张点预测：
@@ -49,6 +59,26 @@
 5. 支持随时取消；完成后文件列表自动刷新，标注结果直接保存到标签目录
 
 批量标注会复用每个模型的类别过滤与置信度设置，跨模型做 NMS 去重后写入标签文件。
+
+### 多模态标注（云端大模型）
+
+不训练任何模型，直接让多模态大模型按类别名读图出框。适合零标注冷启动，或给已有模型补漏。
+
+1. 配置里填接口地址、模型名、API Key（并发数默认 4）
+2. 打开文件夹并填好类别名，例如 `helmet,no-helmet(头部),vest,no-vest(躯干)`
+3. 点顶部「多模态标注」，先「用当前图试一张」，确认后可「开始多模态标注」
+
+类别名后面可以用括号给一个**定位提示**，写法 `类别名(提示)`，例如 `no-helmet(头部),灭火器`。提示只进提示词、只决定框在哪里，不会进类别名，也不会影响类别 ID。像 `no-helmet`、`未系安全带` 这种"缺少某物"的状态类，模型本来没有可指的物体，提示一个具体部位能明显稳住框的位置。
+
+要点：
+
+- 走标准 `chat/completions`，任何 OpenAI 兼容接口都能用，不绑定厂商。图片以 base64 内联，不需要图床。
+- 只依赖 Python 标准库，装了 flask + pillow 即可用。
+- 配置只存本机 `annotate_config.json`（已在 `.gitignore`），Key 不回传浏览器，也可用环境变量 `VLM_API_KEY` 覆盖。
+- **空结果默认不写标签。** 大模型会静默漏标，写成负样本后就分不出「没检出」和「确实没有目标」。确认要负样本可关掉该开关。
+- **接口报错算失败**，不会写成空标签文件。
+
+**这是草稿，不是成品标签。** 同一张图多次调用，输出的类别集合会变（例如某次漏掉 `no-vest`），框也比专门训练的检测器松。务必逐张复核。
 
 ### 数据集自动划分
 
@@ -234,7 +264,11 @@ yolo-image-annotator/
 ```bash
 python tests/test_predict_filter.py
 python tests/test_save_validation.py
+python tests/test_auto_annotate.py
+python tests/test_vlm_annotate.py
 ```
+
+`test_vlm_annotate.py` 不联网，用 fake 的接口响应验证类别映射、坐标换算，以及「空结果 / 接口报错不落盘」几条策略。
 
 ## 常见问题
 
