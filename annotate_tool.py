@@ -272,8 +272,15 @@ def index():
     return Response(HTML_PAGE, mimetype="text/html")
 
 
-@app.route("/api/config")
+@app.route("/api/config", methods=["GET", "POST"])
 def api_config():
+    if request.method == "POST":
+        data = request.get_json() or {}
+        cfg = load_config()
+        if "device" in data:
+            d = str(data.get("device") or "auto").strip().lower()
+            cfg["device"] = d if d in ("auto", "cuda", "cpu") else "auto"
+        save_config(cfg)
     cfg = dict(load_config())
     v = dict(cfg.get("vlm") or {})
     if v.get("api_key"):
@@ -281,6 +288,22 @@ def api_config():
         v["api_key"] = ""      # 不回传明文 key 给浏览器
     cfg["vlm"] = v
     return jsonify(cfg)
+
+
+@app.route("/api/device")
+def api_device():
+    """推理设备诊断：当前会用什么、显卡是否可用。"""
+    info = {"ok": True, "want": (load_config().get("device") or "auto"),
+            "current": torch_device(), "torch": None, "cuda": False, "gpu": None}
+    if torch is not None:
+        info["torch"] = torch.__version__
+        try:
+            info["cuda"] = bool(torch.cuda.is_available())
+            if info["cuda"]:
+                info["gpu"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+    return jsonify(info)
 
 
 @app.route("/api/vlm_config", methods=["GET", "POST"])
@@ -431,9 +454,21 @@ def api_pick_folder():
     return jsonify({"ok": True, "path": path})
 
 
+def _model_device_str(m):
+    """模型实际跑在哪个设备上（给界面显示）。"""
+    try:
+        return str(next(m["model"].parameters()).device)
+    except Exception:
+        try:
+            return str(m["model"].device)
+        except Exception:
+            return "?"
+
+
 def _model_info(m):
     return {"id": m["id"], "name": m["name"], "path": m["path"],
             "backend": m.get("backend"),
+            "device": _model_device_str(m),
             "model_classes": m["model_classes"],
             "cls_offset": m["cls_offset"], "conf": m["conf"],
             "suggested_offset": _suggest_offset(m["model_classes"],
@@ -474,6 +509,7 @@ def api_suggest_offset():
     return jsonify({"ok": False, "msg": "模型不存在"})
 
 
+# --------------------------------------------------------------------------
 # YOLOv5 (.pt) 支持
 #
 # YOLOv5 的 .pt 是「带类定义的 pickle」：里面直接引用了 yolov5 仓库自己的顶层
@@ -663,6 +699,19 @@ if nn is not None:
             return torch.cat([m(x, augment)[0] for m in self], 1), None
 
 
+def torch_device():
+    """推理设备。配置 device = auto / cuda / cpu。
+    auto: 有可用显卡就用显卡，否则 CPU。"""
+    want = str(load_config().get("device") or "auto").strip().lower()
+    if torch is None:
+        return "cpu"
+    if want.startswith("cpu"):
+        return "cpu"
+    if want.startswith(("cuda", "gpu")):
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
 def _install_yolov5_shim():
     """把 models.* 兼容模块注册进 sys.modules（只做一次）。"""
     if nn is None:
@@ -706,7 +755,7 @@ def _load_yolov5(model_path):
         raise RuntimeError("不是 YOLOv5 checkpoint（缺少 model/ema）")
     model = ck.get("ema") if ck.get("ema") is not None else ck.get("model")
     model = model.float().eval()
-    dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(torch_device())
     model = model.to(dev)
     names = getattr(ck.get("model"), "names", None) or getattr(model, "names", None)
     if isinstance(names, dict):
@@ -1493,6 +1542,10 @@ def api_load_model():
                     model_classes = [names[i] for i in sorted(names.keys())]
                 else:
                     model_classes = list(names)
+                try:      # 按配置把 ultralytics 模型放到指定设备
+                    model.to(torch_device())
+                except Exception:
+                    pass
                 backend = "ultralytics"
             except Exception:
                 backend = None
@@ -2289,7 +2342,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <label>全局去重 IoU 阈值</label>
           <input id="iouThr" type="number" step="0.05" min="0" max="1" value="0.5">
         </div>
+        <div class="field">
+          <label>推理设备</label>
+          <select id="devSel" onchange="saveDevice()">
+            <option value="auto">自动（有显卡就用显卡）</option>
+            <option value="cuda">显卡（最快）</option>
+            <option value="cpu">CPU（把显卡让给训练）</option>
+          </select>
+        </div>
       </div>
+      <div class="hint" id="devHint" style="margin-top:6px"></div>
       <div class="hint">加载模型时会按类别名称自动匹配类别偏移（忽略大小写/下划线）；匹配不上可点卡片里的“自动匹配偏移”。同类别重叠框只保留置信度高的，不同类别（如安全帽 + 反光衣）同时保留。</div>
     </div>
 
@@ -2561,6 +2623,7 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
   if(c.classes)document.getElementById('classesIn').value=c.classes;
   fillVlmFields(c.vlm||{});
+  refreshDeviceInfo();
   initModelSlots(c.models||[]);
   // 服务端可能还开着文件夹、甚至还有批量任务在跑，刷新页面不该把这些丢掉
   fetch('/api/files').then(r=>r.json()).then(d=>{
@@ -2600,6 +2663,32 @@ function resumeBatch(a){
     openOverlay('autoMask');
     pollAuto();
   }
+}
+
+function refreshDeviceInfo(){
+  fetch('/api/device').then(r=>r.json()).then(d=>{
+    if(!d.ok)return;
+    const sel=document.getElementById('devSel');
+    if(sel&&d.want)sel.value=d.want;
+    const h=document.getElementById('devHint');
+    if(!h)return;
+    if(!d.torch){
+      h.textContent='未安装 PyTorch，无法加载模型（只做手动标注不需要）';
+    }else if(!d.cuda){
+      h.textContent='PyTorch '+d.torch+'：未检测到可用显卡，只能用 CPU 推理';
+    }else{
+      h.textContent='PyTorch '+d.torch+' · '+d.gpu+' · 当前推理设备 '+
+                    d.current+(d.current==='cpu'?'（已让出显卡）':'');
+    }
+  }).catch(()=>{});
+}
+function saveDevice(){
+  const v=document.getElementById('devSel').value;
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device:v})}).then(()=>{
+      refreshDeviceInfo();
+      st('推理设备已设为「'+v+'」，重新加载模型后生效');
+    });
 }
 
 function fillVlmFields(v){
@@ -2690,7 +2779,7 @@ function applyServerModels(list,quiet){
     if(!s){
       s=newModelSlot();s.path=m.path;modelSlots.push(s);
     }
-    s.id=m.id;s.model_classes=m.model_classes;
+  s.id=m.id;s.model_classes=m.model_classes;s.device=m.device;
     s.cls_offset=m.cls_offset;s.conf=m.conf;s.only_cls=m.only_cls;
   });
   renderModelCards();
@@ -2737,6 +2826,16 @@ function buildModelCard(s){
   cf.onchange=()=>{s.conf=parseFloat(cf.value)||0.25;if(s.id)updateModelSlot(s.key,{conf:s.conf});};
   cfWrap.appendChild(cfLb);cfWrap.appendChild(cf);
   opts.appendChild(offWrap);opts.appendChild(cfWrap);
+  if(s.device){
+    const devWrap=document.createElement('div');
+    const devLb=document.createElement('label');devLb.textContent='运行设备';
+    const devTag=document.createElement('div');
+    devTag.style.cssText='height:32px;display:flex;align-items:center;font-size:12px;'+
+      'color:var(--text-2);font-variant-numeric:tabular-nums;';
+    devTag.textContent=s.device;
+    devWrap.appendChild(devLb);devWrap.appendChild(devTag);
+    opts.appendChild(devWrap);
+  }
   card.appendChild(opts);
   if(s.id&&classes.length){
     const autoBtn=document.createElement('button');

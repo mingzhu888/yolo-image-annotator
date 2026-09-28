@@ -741,6 +741,42 @@ def test_load_local_model_prefers_yolov5():
         at._load_yolov5, at._load_meituan_v6n = orig_v5, orig_v6
 
 
+def test_device_setting_and_endpoint():
+    """推理设备可切换（训练占用显卡时可让给 CPU），非法值回落 auto。"""
+    import shutil
+    cfg = at.CONFIG_FILE
+    bak = cfg + ".dev-bak"
+    if os.path.isfile(cfg):
+        shutil.copyfile(cfg, bak)
+    try:
+        c = at.app.test_client()
+        d = c.get("/api/device").get_json()
+        assert d["ok"] and d["want"] in ("auto", "cuda", "cpu")
+        assert "current" in d
+
+        assert c.post("/api/config", json={"device": "cpu"}).status_code == 200
+        assert at.load_config().get("device") == "cpu"
+        assert at.torch_device() == "cpu"      # 明确要求 CPU 就必须是 CPU
+
+        c.post("/api/config", json={"device": "cuda"})
+        assert at.load_config().get("device") == "cuda"
+        # 无 torch 环境下 cuda 请求会回落 cpu，但不能崩
+        assert at.torch_device() in ("cpu", "cuda:0")
+
+        c.post("/api/config", json={"device": "GPU9999"})
+        assert at.load_config().get("device") == "auto"
+    finally:
+        if os.path.isfile(bak):
+            shutil.copyfile(bak, cfg)
+            os.remove(bak)
+
+
+def test_model_device_str_fallbacks():
+    """设备信息取不到时不要抛错，界面还得能显示。"""
+    assert at._model_device_str({"model": object()}) == "?"
+    assert isinstance(at._model_device_str({"model": None}), str)
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:
