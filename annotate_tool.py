@@ -2098,11 +2098,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-track{background:transparent;}
 
   /* 顶栏 */
-  #topbar{height:var(--topbar-h);display:flex;align-items:center;gap:8px;padding:0 12px;background:var(--surface);border-bottom:1px solid var(--border);}
-  #topbar .logo{font-weight:600;font-size:13px;margin-right:8px;display:flex;align-items:center;gap:8px;color:var(--text-2);}
+  #topbar{height:var(--topbar-h);display:flex;align-items:center;gap:6px;padding:0 12px;background:var(--surface);border-bottom:1px solid var(--border);}
+  #topbar .logo{font-weight:600;font-size:13px;margin-right:4px;display:flex;align-items:center;gap:8px;color:var(--text-2);flex:0 0 auto;white-space:nowrap;}
   #topbar .logo .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);}
-  #curFolder{font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .tbtn{height:32px;padding:0 12px;font-size:13px;font-weight:500;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-m);display:inline-flex;align-items:center;gap:6px;transition:background-color .15s ease,border-color .15s ease,transform .1s var(--ease-out);}
+  /* 文件夹路径是唯一的「弹性」元素：窗口窄时它先被省略，
+     按钮用 nowrap + flex:0 0 auto 保证绝不被压到换行（中文没有空格，
+     一旦允许收缩就会被压成一个字宽，文字竖排，非常难看）。 */
+  #curFolder{font-size:12px;color:var(--text-3);flex:0 1 auto;min-width:60px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .tbtn{height:32px;padding:0 11px;font-size:13px;font-weight:500;background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-m);display:inline-flex;align-items:center;gap:6px;white-space:nowrap;flex:0 0 auto;transition:background-color .15s ease,border-color .15s ease,transform .1s var(--ease-out);}
   .tbtn:active{transform:scale(.97);}
   @media (hover:hover) and (pointer:fine){.tbtn:hover{background:var(--surface-3);}}
   .tbtn.primary{background:var(--accent);border-color:transparent;color:#fff;}
@@ -2111,8 +2114,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tbtn.ghost{background:transparent;border-color:transparent;}
   @media (hover:hover) and (pointer:fine){.tbtn.ghost:hover{background:var(--surface-2);}}
   .tbtn:disabled{opacity:.4;cursor:default;transform:none;}
-  #navInfo{font-size:12px;color:var(--text-3);min-width:150px;text-align:center;font-variant-numeric:tabular-nums;}
-  .spacer{flex:1;}
+  #navInfo{font-size:12px;color:var(--text-3);flex:0 0 auto;min-width:96px;text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap;}
+  .spacer{flex:1 1 auto;min-width:8px;}
+  .tsep{flex:0 0 auto;width:1px;height:18px;background:var(--border);margin:0 3px;}
 
   /* 布局 */
   #layout{display:flex;height:calc(100vh - var(--topbar-h) - var(--statusbar-h));}
@@ -2211,6 +2215,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="tbtn" id="btnAuto" onclick="openAuto()" disabled>自动化标注</button>
   <button class="tbtn" id="btnVlmAuto" onclick="openVlmAuto()" disabled>多模态标注</button>
   <button class="tbtn" id="btnVlmReview" onclick="openVlmReview()" disabled>多模态复核</button>
+  <div class="tsep"></div>
   <button class="tbtn" id="btnClear" onclick="clearBoxes()" disabled>清空</button>
   <button class="tbtn primary" id="btnSave" onclick="saveLabels()" disabled>保存</button>
 </div>
