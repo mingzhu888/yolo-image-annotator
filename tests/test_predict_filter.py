@@ -111,16 +111,17 @@ def test_filter_empty_keeps_nothing():
         assert d["boxes"] == []
 
 
-def test_nms_merges_duplicates_across_models():
+def test_nms_keeps_same_class_across_models():
     with tempfile.TemporaryDirectory() as tmp:
-        # 两个模型都检出同一个目标(同类别、同位置),只保留置信度高的
+        # 现行设计：按(模型来源,类别)分组 NMS。两个模型各自检出同一个目标时都保留，
+        # 避免一个模型把另一个模型的同类框吞掉（跨模型融合由下游策略决定）。
         _set_state(tmp, [_entry(1, [(0, 0.9)]),
                          _entry(2, [(0, 0.6)])])
         d = _predict()
         assert d["ok"]
-        assert len(d["boxes"]) == 1
+        assert len(d["boxes"]) == 2
         kept = {s["name"]: s["kept"] for s in d["stats"]}
-        assert kept == {"m1": 1, "m2": 0}
+        assert kept == {"m1": 1, "m2": 1}
 
 
 def test_nms_keeps_different_classes():
@@ -136,16 +137,30 @@ def test_nms_keeps_different_classes():
 
 def test_nms_merges_contained_boxes():
     with tempfile.TemporaryDirectory() as tmp:
-        # 大框完全套着小框(同类别,IoU<0.5),应视为同一目标只保留置信度高的
+        # 同一模型内：大框完全套着小框(同类别,IoU<0.5)，应视为同一目标只保留置信度高的
         m1 = _entry(1, [])
-        m1["model"] = _BoxModel([(0, 0.9, 0.25, 0.25, 0.5, 0.5)])
-        m2 = _entry(2, [])
-        m2["model"] = _BoxModel([(0, 0.8, 0.25, 0.25, 0.3, 0.3)])
-        _set_state(tmp, [m1, m2])
+        m1["model"] = _BoxModel([(0, 0.9, 0.25, 0.25, 0.5, 0.5),
+                                 (0, 0.8, 0.25, 0.25, 0.3, 0.3)])
+        _set_state(tmp, [m1])
         d = _predict()
         assert d["ok"]
         assert len(d["boxes"]) == 1
         assert abs(d["boxes"][0]["w"] - 0.5) < 1e-6  # 保留置信度 0.9 的大框
+
+
+def test_out_of_range_class_dropped():
+    # 模型有 2 类、数据集只有 2 类时，offset=1 会让类别 1 变成越界的 2。
+    # 旧版会夹到最后一类(1)造成"安全帽变 no-vest"式污染；现在必须直接丢弃。
+    with tempfile.TemporaryDirectory() as tmp:
+        _set_state(tmp, [_entry(1, [(0, 0.9), (1, 0.8)], offset=0)])
+        d = _predict()
+        assert d["ok"]
+        assert {b["cls"] for b in d["boxes"]} == {0, 1}   # 合法范围内正常输出
+        _set_state(tmp, [_entry(1, [(1, 0.9)], offset=1)])
+        d = _predict()
+        assert d["ok"]
+        assert d["boxes"] == []                          # 1+1=2 越界 -> 丢弃，不再夹成 1
+        assert d["stats"][0]["raw"] == 1
 
 
 def test_duplicate_path_rejected():
@@ -197,9 +212,10 @@ if __name__ == "__main__":
     test_no_filter_keeps_all()
     test_filter_one_class()
     test_filter_empty_keeps_nothing()
-    test_nms_merges_duplicates_across_models()
+    test_nms_keeps_same_class_across_models()
     test_nms_keeps_different_classes()
     test_nms_merges_contained_boxes()
+    test_out_of_range_class_dropped()
     test_duplicate_path_rejected()
     test_suggest_offset()
     test_suggest_offset_endpoint()

@@ -240,10 +240,16 @@ def _validate_boxes(boxes, n_cls):
 
 
 def _write_label_file(lp, boxes):
-    """把框列表写入 YOLO 标签文件。"""
+    """把框列表写入 YOLO 标签文件。覆盖前自动留一份 .bak（每文件仅首次）。"""
     lines, errors = _validate_boxes(boxes, len(STATE["classes"]))
     if errors:
         raise ValueError("；".join(errors[:10]))
+    try:
+        if os.path.isfile(lp) and not os.path.isfile(lp + ".bak"):
+            with open(lp, "rb") as _src, open(lp + ".bak", "wb") as _dst:
+                _dst.write(_src.read())
+    except Exception:
+        pass
     with open(lp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
         if lines:
@@ -1517,6 +1523,9 @@ def _apply_review(boxes, verdicts, classes):
     return out, changes
 
 
+_MODEL_LOADING = [False]   # 加载锁：堵住"检查-添加"之间的并发竞态（同路径加载出两个模型）
+
+
 @app.route("/api/load_model", methods=["POST"])
 def api_load_model():
     data = request.get_json() or {}
@@ -1528,6 +1537,9 @@ def api_load_model():
         if os.path.normcase(os.path.abspath(m["path"])) == norm_path:
             return jsonify({"ok": False,
                             "msg": f"该模型已加载: {m['name']}，请勿重复添加"})
+    if _MODEL_LOADING[0]:
+        return jsonify({"ok": False, "msg": "模型加载中，请勿重复点击"})
+    _MODEL_LOADING[0] = True
     try:
         from ultralytics import YOLO
     except ImportError:
@@ -1580,6 +1592,8 @@ def api_load_model():
                         "models": [_model_info(m) for m in STATE["models"]]})
     except Exception as e:
         return jsonify({"ok": False, "msg": f"加载失败: {e}"})
+    finally:
+        _MODEL_LOADING[0] = False
 
 
 @app.route("/api/update_model", methods=["POST"])
@@ -1697,8 +1711,9 @@ def _predict_all(path, iou_thr=0.5):
                     if m["only_cls"] is not None and model_cls not in m["only_cls"]:
                         continue
                     cls = model_cls + m["cls_offset"]
-                    if n_cls:
-                        cls = max(0, min(n_cls - 1, cls))
+                    if n_cls and not (0 <= cls < n_cls):
+                        # 越界类别必须丢弃：夹到最后一类会把"安全帽"污染成"no-vest"
+                        continue
                     collected.append({"cls": cls, "cx": b["cx"], "cy": b["cy"],
                                       "w": b["w"], "h": b["h"],
                                       "conf": b["conf"], "source": m["id"]})
@@ -1716,8 +1731,8 @@ def _predict_all(path, iou_thr=0.5):
                         except Exception:
                             continue
                         cls = model_cls + m["cls_offset"]
-                        if n_cls:
-                            cls = max(0, min(n_cls - 1, cls))
+                        if n_cls and not (0 <= cls < n_cls):
+                            continue
                         collected.append({"cls": cls, "cx": xc, "cy": yc,
                                           "w": ww, "h": hh,
                                           "conf": conf,
@@ -2254,7 +2269,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v1.0</span></div>
+  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v1.1</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">配置</button>
   <button class="tbtn ghost" id="themeBtn" onclick="toggleTheme()" title="切换深色 / 浅色">浅色</button>
@@ -2775,11 +2790,12 @@ function applyServerModels(list,quiet){
     }
   });
   list.forEach(m=>{
-    let s=modelSlots.find(x=>x.path===m.path);
+    // 先按 id 匹配；同路径但未加载的本地卡才复用。避免两个同路径模型被合并成一张卡而看不见
+    let s=modelSlots.find(x=>x.id===m.id)||modelSlots.find(x=>x.path===m.path&&!x.id);
     if(!s){
-      s=newModelSlot();s.path=m.path;modelSlots.push(s);
+      s=newModelSlot();modelSlots.push(s);
     }
-  s.id=m.id;s.model_classes=m.model_classes;s.device=m.device;
+    s.path=m.path;s.id=m.id;s.model_classes=m.model_classes;s.device=m.device;
     s.cls_offset=m.cls_offset;s.conf=m.conf;s.only_cls=m.only_cls;
   });
   renderModelCards();
@@ -2851,7 +2867,7 @@ function buildModelCard(s){
     if(classes.length){
       const mapTxt=s.model_classes.map((c,i)=>{
         const aid=i+s.cls_offset;
-        return c+' → '+(classes[aid]||('ID '+aid));
+        return c+' → '+(classes[aid]||('ID '+aid+'（越界，将丢弃）'));
       }).join('，');
       status.textContent='偏移 '+s.cls_offset+(s.auto_offset?'（自动匹配）':'')+' | '+mapTxt;
     }else{
@@ -2891,14 +2907,17 @@ function collectSlotCls(s){
   cbs.forEach(cb=>{if(cb.checked)sel.push(parseInt(cb.value));});
   s.only_cls=sel;
 }
+let loadingModelSlot=false;
 function loadModelSlot(key){
+  if(loadingModelSlot){return;}
   const s=modelSlots.find(x=>x.key===key);
   if(!s||!s.path.trim()){alert('请先填写模型路径');return;}
+  loadingModelSlot=true;
   fetch('/api/load_model',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({model_path:s.path.trim(),cls_offset:null,conf:s.conf})}).then(r=>r.json()).then(d=>{
     if(!d.ok){alert('加载失败: '+(d.msg||'未知错误'));return;}
     applyServerModels(d.models);
-  });
+  }).catch(()=>{}).finally(()=>{loadingModelSlot=false;});
 }
 function applySuggested(key){
   const s=modelSlots.find(x=>x.key===key);
@@ -3224,13 +3243,10 @@ function predict(){
     let warn='';
     if(classes.length){
       let clsBad=0;
-      added.forEach(b=>{
-        if(b.cls<0||b.cls>=classes.length){
-          clsBad++;
-          b.cls=Math.max(0,Math.min(classes.length-1,b.cls));
-        }
-      });
-      if(clsBad)warn='，其中 '+clsBad+' 个框类别超出范围已自动归到合法类别，请检查类别偏移';
+      for(let k=added.length-1;k>=0;k--){
+        if(added[k].cls<0||added[k].cls>=classes.length){added.splice(k,1);clsBad++;}
+      }
+      if(clsBad)warn='，其中 '+clsBad+' 个框类别超出数据集范围已丢弃（请检查类别偏移/取消勾选该类别）';
     }
     if(added.length){snap();boxes.push(...added);markDirty();}
     const stats=(d.stats||[]).map(s=>s.error? s.name+': 失败('+s.error+')'
