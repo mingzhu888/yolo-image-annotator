@@ -2544,7 +2544,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="hint">模型路径支持 <b>rknn://模型代码</b>；两级级联写 <b>rknn://yqzk_smoke?person=person_infra</b>。.rknn 只能在 RK3588 的 NPU 上执行，本机经 SSH 隧道访问该地址。</div>
 
       <div class="grp" style="margin-top:12px">
-        <div class="gt">④ 一键 RKNN 标注（员工模式）</div>
+        <div class="gt">RKNN 模型（加入上方模型列表）</div>
+        <div class="hint" style="margin:0 0 8px">选择后只加载模型并返回标注界面；当前图用“模型预测”，整批用“自动化标注”。</div>
         <div class="inline">
           <div class="field" style="flex:2">
             <label for="rknnModelSearch">模型 <span id="rknnStatus" style="font-weight:400"></span></label>
@@ -2568,7 +2569,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
         <div class="hint" id="rknnModelHint" style="margin-top:6px"></div>
         <div class="inline" style="align-items:center">
-          <button class="tbtn primary" id="rknnGoBtn" onclick="oneClickRknn()">一键开始标注</button>
+          <button class="tbtn primary" id="rknnGoBtn" onclick="loadRknnModelForAnnotating()">加载并返回标注界面</button>
           <button class="tbtn" onclick="loadRknnModels()">刷新模型</button>
         </div>
       </div>
@@ -3145,56 +3146,48 @@ function onRknnModelChange(){
   hint.innerHTML='类别已自动填入：<b>'+(m.labels||[]).join(' / ')+'</b>'+
     '　输入 '+m.input_size+'　'+(m.role==='infra'?'裁块模型（建议级联）':'整帧模型');
 }
-async function oneClickRknn(){
+async function loadRknnModelForAnnotating(){
   const code=document.getElementById('rknnModelSel').value;
   if(!code){alert('请先选择模型');return;}
   const img_dir=document.getElementById('imgDir').value.trim();
   const label_dir=document.getElementById('labelDir').value.trim();
-  const classes=document.getElementById('classesIn').value.split(',')
+  const requestedClasses=document.getElementById('classesIn').value.split(',')
       .map(s=>s.trim()).filter(Boolean);
   const conf=parseFloat(document.getElementById('rknnConf').value)||0.1;
   if(!img_dir){alert('请先选择图片文件夹');return;}
-  if(!classes.length){alert('类别为空：请重新选择模型');return;}
+  if(!requestedClasses.length){alert('类别为空：请重新选择模型');return;}
   const btn=document.getElementById('rknnGoBtn');
   btn.disabled=true;btn.textContent='准备中…';
   try{
     const o=await (await fetch('/api/open',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({img_dir,label_dir,classes})})).json();
+      body:JSON.stringify({img_dir,label_dir,classes:requestedClasses})})).json();
     if(!o.ok){alert(o.msg);return;}
-    total=o.count;idx=0;files=o.files;classes=o.classes.slice();
+    total=o.count;idx=0;files=o.files;
+    classes=(o.classes&&o.classes.length)?o.classes.slice():requestedClasses;
     const cf=document.getElementById('curFolder');
     if(cf){cf.textContent=o.img_dir||'';cf.title=o.img_dir||'';}
     const cur=await (await fetch('/api/models')).json();
-    for(const m of (cur.models||[])){
-      await fetch('/api/unload_model',{method:'POST',
+    let models=cur.models||[];
+    const spec='rknn://'+code;
+    const existing=models.find(m=>String(m.path).toLowerCase()===spec.toLowerCase());
+    if(!existing){
+      const l=await (await fetch('/api/load_model',{method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({id:m.id})});
+        body:JSON.stringify({model_path:spec,conf})})).json();
+      if(!l.ok){alert('加载模型失败：'+l.msg);return;}
+      models=l.models||[];
     }
-    const l=await (await fetch('/api/load_model',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model_path:'rknn://'+code,conf})})).json();
-    if(!l.ok){alert('加载模型失败：'+l.msg);return;}
+    applyServerModels(models);
     closeModal();
     ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto',
      'btnSplit','btnVlmAuto','btnVlmReview'].forEach(id=>{
       const el=document.getElementById(id);if(el)el.disabled=false;});
     buildClsBtns();buildFileList();load(0);
-    autoActive=true;
-    document.getElementById('autoIou').value='0.5';
-    document.getElementById('autoBar').style.width='0%';
-    document.getElementById('autoMsg').textContent='';
-    document.getElementById('autoSkip').checked=true;
-    openOverlay('autoMask');
-    document.getElementById('autoStartBtn').disabled=true;
-    document.getElementById('autoCancelBtn').disabled=false;
-    const r=await (await fetch('/api/auto_annotate',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({skip_labeled:true,iou:0.5})})).json();
-    if(!r.ok){alert(r.msg);return;}
-    pollAuto();
+    st(existing?'RKNN 模型已在列表中，可以直接预测'
+              :'RKNN 模型已加载，请点击“模型预测”');
   }catch(e){alert('出错：'+e);}
-  finally{btn.disabled=false;btn.textContent='一键开始标注';}
+  finally{btn.disabled=false;btn.textContent='加载并返回标注界面';}
 }
 
 function fillVlmFields(v){
