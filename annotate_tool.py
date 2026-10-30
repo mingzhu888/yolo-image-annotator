@@ -286,6 +286,8 @@ def api_config():
         if "device" in data:
             d = str(data.get("device") or "auto").strip().lower()
             cfg["device"] = d if d in ("auto", "cuda", "cpu") else "auto"
+        if "rknn_url" in data:
+            cfg["rknn_url"] = str(data.get("rknn_url") or "").strip()
         save_config(cfg)
     cfg = dict(load_config())
     v = dict(cfg.get("vlm") or {})
@@ -858,6 +860,83 @@ def _infer_yolov5(model, img_path, conf, iou=0.45, size=640):
             "cx": ((x1 + x2) / 2.0) / W, "cy": ((y1 + y2) / 2.0) / H,
             "w": (x2 - x1) / W, "h": (y2 - y1) / H})
     return out_list
+
+
+def _rknn_base_url():
+    return (load_config().get("rknn_url") or "http://127.0.0.1:8077").rstrip("/")
+
+
+def _parse_rknn_spec(spec):
+    """rknn://CODE?person=PERSON_CODE -> (code, person_code)"""
+    raw = spec[len("rknn://"):]
+    code, _, query = raw.partition("?")
+    person = ""
+    for kv in query.split("&"):
+        k, _, v = kv.partition("=")
+        if k.strip() == "person":
+            person = v.strip()
+    return code.strip(), person
+
+
+def _http_json(url, payload=None, timeout=120):
+    import urllib.request
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="GET" if data is None else "POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _load_rknn_remote(spec):
+    """连接 RKNN 推理服务（.rknn 只能在 RK3588 的 NPU 上执行，
+    通过 SSH 隧道映射到本机 127.0.0.1）。返回 (entry, labels)。"""
+    code, person = _parse_rknn_spec(spec)
+    base = _rknn_base_url()
+    info = _http_json(base + "/models")
+    hit = [m for m in info.get("models", []) if m.get("code") == code]
+    if not hit:
+        raise RuntimeError("RKNN 服务里没有模型 %s（共 %d 个）"
+                           % (code, len(info.get("models", []))))
+    labels = hit[0].get("labels") or []
+    return {"base": base, "code": code, "person": person,
+            "input_size": hit[0].get("input_size"), "labels": labels}, labels
+
+
+def _infer_rknn_remote(entry, img_path, conf):
+    """调用远程 RKNN 服务，返回归一化 [{cls,cx,cy,w,h,conf}]。"""
+    import base64
+    with open(img_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    cfg = load_config()
+    body = {"model": entry["code"], "image": b64, "conf": float(conf)}
+    if entry.get("person"):
+        body["person_model"] = entry["person"]
+        body["min_person_conf"] = float(cfg.get("rknn_min_person_conf") or 0.5)
+        body["crop_expand"] = float(cfg.get("rknn_crop_expand") or 1.2)
+    d = _http_json(entry["base"] + "/infer", body,
+                   timeout=float(cfg.get("rknn_timeout") or 120))
+    if not d.get("ok"):
+        raise RuntimeError(d.get("error") or "RKNN 推理失败")
+    with Image.open(img_path) as im:
+        W, H = im.size
+    classes = STATE["classes"]
+    out, unmapped = [], 0
+    for b in d.get("boxes", []):
+        cls = _vlm_map_label(b.get("label"), classes)
+        if cls is None:
+            unmapped += 1
+            continue
+        x1, y1 = max(0.0, b["x1"]), max(0.0, b["y1"])
+        x2, y2 = min(float(W), b["x2"]), min(float(H), b["y2"])
+        if x2 <= x1 or y2 <= y1:
+            continue
+        out.append({"cls": cls, "conf": float(b.get("conf", 0.5)),
+                    "cx": (x1 + x2) / 2.0 / W, "cy": (y1 + y2) / 2.0 / H,
+                    "w": (x2 - x1) / float(W), "h": (y2 - y1) / float(H)})
+    if unmapped:
+        print("[rknn] %d 个框的类别名不在数据集类别里，已丢弃" % unmapped)
+    return out
 
 
 def _load_local_model(model_path):
@@ -1530,11 +1609,15 @@ _MODEL_LOADING = [False]   # 加载锁：堵住"检查-添加"之间的并发竞
 def api_load_model():
     data = request.get_json() or {}
     model_path = data.get("model_path", "").strip().strip('"')
-    if not model_path or not os.path.isfile(model_path):
+    is_remote = model_path.startswith("rknn://")
+    if not model_path or (not is_remote and not os.path.isfile(model_path)):
         return jsonify({"ok": False, "msg": f"模型文件不存在: {model_path}"})
-    norm_path = os.path.normcase(os.path.abspath(model_path))
+    norm_path = (model_path.lower() if is_remote
+                 else os.path.normcase(os.path.abspath(model_path)))
     for m in STATE["models"]:
-        if os.path.normcase(os.path.abspath(m["path"])) == norm_path:
+        other = (m["path"].lower() if m["path"].startswith("rknn://")
+                 else os.path.normcase(os.path.abspath(m["path"])))
+        if other == norm_path:
             return jsonify({"ok": False,
                             "msg": f"该模型已加载: {m['name']}，请勿重复添加"})
     if _MODEL_LOADING[0]:
@@ -1546,7 +1629,10 @@ def api_load_model():
         YOLO = None      # 没有 ultralytics 也能加载 YOLOv5 / 美团 v6n 权重
     try:
         model = model_classes = backend = None
-        if YOLO is not None:
+        if is_remote:
+            model, model_classes = _load_rknn_remote(model_path)
+            backend = "rknn_remote"
+        elif YOLO is not None:
             try:
                 model = YOLO(model_path)
                 names = model.names
@@ -1576,7 +1662,8 @@ def api_load_model():
             auto_offset = False
         entry = {
             "id": mid,
-            "name": os.path.basename(model_path),
+            "name": (model_path[len("rknn://"):] if is_remote
+                     else os.path.basename(model_path)),
             "path": model_path,
             "model": model,
             "backend": backend,
@@ -1701,10 +1788,13 @@ def _predict_all(path, iou_thr=0.5):
     for m in STATE["models"]:
         raw = 0
         try:
-            if m.get("backend") in ("meituan_v6n", "yolov5"):
-                preds = (_infer_meituan(m["model"], path, m["conf"])
-                         if m.get("backend") == "meituan_v6n"
-                         else _infer_yolov5(m["model"], path, m["conf"]))
+            if m.get("backend") in ("meituan_v6n", "yolov5", "rknn_remote"):
+                if m.get("backend") == "meituan_v6n":
+                    preds = _infer_meituan(m["model"], path, m["conf"])
+                elif m.get("backend") == "yolov5":
+                    preds = _infer_yolov5(m["model"], path, m["conf"])
+                else:
+                    preds = _infer_rknn_remote(m["model"], path, m["conf"])
                 raw = len(preds)
                 for b in preds:
                     model_cls = b["cls"]
@@ -2367,6 +2457,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="hint" id="devHint" style="margin-top:6px"></div>
+      <div class="inline">
+        <div class="field" style="flex:2">
+          <label>RKNN 推理服务地址</label>
+          <input id="rknnUrl" type="text" placeholder="http://127.0.0.1:8077" onchange="saveRknnUrl()">
+        </div>
+      </div>
+      <div class="hint">模型路径支持 <b>rknn://模型代码</b>；两级级联写 <b>rknn://yqzk_smoke?person=person_infra</b>。.rknn 只能在 RK3588 的 NPU 上执行，本机经 SSH 隧道访问该地址。</div>
       <div class="hint">加载模型时会按类别名称自动匹配类别偏移（忽略大小写/下划线）；匹配不上可点卡片里的“自动匹配偏移”。同类别重叠框只保留置信度高的，不同类别（如安全帽 + 反光衣）同时保留。</div>
     </div>
 
@@ -2638,6 +2735,7 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
   if(c.classes)document.getElementById('classesIn').value=c.classes;
   fillVlmFields(c.vlm||{});
+  if(c.rknn_url)document.getElementById('rknnUrl').value=c.rknn_url;
   refreshDeviceInfo();
   initModelSlots(c.models||[]);
   // 服务端可能还开着文件夹、甚至还有批量任务在跑，刷新页面不该把这些丢掉
@@ -2704,6 +2802,12 @@ function saveDevice(){
       refreshDeviceInfo();
       st('推理设备已设为「'+v+'」，重新加载模型后生效');
     });
+}
+
+function saveRknnUrl(){
+  const v=document.getElementById('rknnUrl').value.trim();
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({rknn_url:v})}).then(()=>st('RKNN 服务地址已保存'));
 }
 
 function fillVlmFields(v){

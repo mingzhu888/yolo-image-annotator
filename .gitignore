@@ -7,3 +7,4 @@ annotate_config.json
 backup/
 .DS_Store
 Thumbs.db
+_rknn_test/
