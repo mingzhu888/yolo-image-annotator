@@ -2335,6 +2335,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .model-card .mc-cls{max-height:140px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-m);padding:6px;margin-top:8px;background:var(--surface);}
   .model-card .mc-cls label{display:flex;align-items:center;gap:8px;padding:4px 6px;font-size:12px;cursor:pointer;border-radius:var(--radius-s);}
   @media (hover:hover) and (pointer:fine){.model-card .mc-cls label:hover{background:var(--surface-2);}}
+  .model-picker{position:relative;}
+  .model-picker input[type=text]{width:100%;padding-right:30px;}
+  .model-picker .caret{position:absolute;right:11px;top:50%;transform:translateY(-50%);color:var(--text-3);font-size:10px;pointer-events:none;}
+  .model-options{position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:30;max-height:260px;overflow-y:auto;padding:4px;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius-m);box-shadow:var(--shadow-lg);}
+  .model-option{display:flex;align-items:center;gap:10px;width:100%;min-height:34px;padding:6px 8px;text-align:left;border-radius:var(--radius-s);color:var(--text);}
+  .model-option:hover,.model-option.active{background:var(--surface-3);}
+  .model-option .name{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;}
+  .model-option .code{max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-3);font-size:11px;font-variant-numeric:tabular-nums;}
+  .model-options .empty{padding:10px 8px;color:var(--text-3);font-size:12px;}
   #boxList{max-height:240px;overflow-y:auto;padding-right:2px;}
   .box-item{display:flex;align-items:center;gap:8px;height:30px;padding:0 8px;margin:3px 0;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-m);font-size:12px;transition:background-color .12s ease,border-color .12s ease;}
   @media (hover:hover) and (pointer:fine){.box-item:hover{background:var(--surface-3);}}
@@ -2490,10 +2499,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="gt">④ 一键 RKNN 标注（员工模式）</div>
         <div class="inline">
           <div class="field" style="flex:2">
-            <label>模型 <span id="rknnStatus" style="font-weight:400"></span></label>
-            <select id="rknnModelSel" onchange="onRknnModelChange()">
-              <option value="">（正在读取…）</option>
-            </select>
+            <label for="rknnModelSearch">模型 <span id="rknnStatus" style="font-weight:400"></span></label>
+            <div class="model-picker" id="rknnModelPicker">
+              <input id="rknnModelSearch" type="text" autocomplete="off"
+                     placeholder="搜索模型名称、代码或类别"
+                     role="combobox" aria-autocomplete="list" aria-expanded="false"
+                     aria-controls="rknnModelOptions"
+                     onfocus="openRknnModelPicker(true)"
+                     oninput="filterRknnModels()"
+                     onkeydown="onRknnSearchKeydown(event)">
+              <span class="caret">▼</span>
+              <div class="model-options" id="rknnModelOptions" role="listbox" hidden></div>
+              <input id="rknnModelSel" type="hidden" value="">
+            </div>
           </div>
           <div class="field" style="flex:1">
             <label>置信度</label>
@@ -2855,25 +2873,134 @@ function saveRknnUrl(){
 
 function loadRknnModels(){
   const sel=document.getElementById('rknnModelSel');
+  const search=document.getElementById('rknnModelSearch');
   const stEl=document.getElementById('rknnStatus');
-  if(!sel||!stEl)return Promise.resolve();
+  if(!sel||!search||!stEl)return Promise.resolve();
   stEl.textContent='（读取中…）';stEl.style.color='var(--text-3)';
   return fetch('/api/rknn/models').then(r=>r.json()).then(d=>{
+    const previous=sel.value;
     window.__rknnModels=d.models||[];
     if(!d.ok){
       stEl.textContent='（设备离线）';stEl.style.color='#e5484d';
-      sel.innerHTML='<option value="">设备离线：检查隧道和服务</option>';
+      sel.value='';search.value='';
+      renderRknnModelOptions();
       document.getElementById('rknnModelHint').textContent=d.msg||'';
       return;
     }
     stEl.textContent='（在线 '+window.__rknnModels.length+' 个）';
     stEl.style.color='var(--text-3)';
-    sel.innerHTML='<option value="">请选择模型…</option>'+
-      window.__rknnModels.map(m=>'<option value="'+m.code+'">'+
-        (m.name||m.code)+'　['+m.code+']</option>').join('');
+    sel.value='';search.value='';
+    const keep=window.__rknnModels.find(m=>m.code===previous);
+    if(keep)selectRknnModel(keep.code,false);
+    else renderRknnModelOptions();
     document.getElementById('rknnModelHint').textContent='';
-  }).catch(()=>{stEl.textContent='（连接失败）';stEl.style.color='#e5484d';});
+  }).catch(()=>{
+    stEl.textContent='（连接失败）';stEl.style.color='#e5484d';
+    window.__rknnModels=[];
+    sel.value='';search.value='';
+    renderRknnModelOptions();
+  });
 }
+function rknnModelLabel(m){
+  return (m.name||m.code)+' ['+m.code+']';
+}
+function renderRknnModelOptions(query){
+  const list=document.getElementById('rknnModelOptions');
+  if(!list)return;
+  const needle=String(query||'').trim().toLowerCase();
+  const models=window.__rknnModels||[];
+  const terms=needle?needle.split(/\s+/):[];
+  const filtered=models.filter(m=>{
+    const hay=[m.name,m.code].concat(m.labels||[]).join(' ').toLowerCase();
+    return terms.every(t=>hay.includes(t));
+  });
+  window.__rknnFiltered=filtered;
+  window.__rknnActive=needle&&filtered.length?0:-1;
+  list.replaceChildren();
+  if(!filtered.length){
+    const empty=document.createElement('div');
+    empty.className='empty';
+    empty.textContent=models.length?'没有匹配的模型':'暂无可用模型';
+    list.appendChild(empty);
+    return;
+  }
+  filtered.forEach((m,i)=>{
+    const option=document.createElement('button');
+    option.type='button';option.className='model-option'+(i===window.__rknnActive?' active':'');
+    option.role='option';
+    option.dataset.code=m.code;option.dataset.index=String(i);
+    const name=document.createElement('span');
+    name.className='name';name.textContent=m.name||m.code;
+    const code=document.createElement('span');
+    code.className='code';code.textContent=m.code;
+    option.append(name,code);
+    option.onmousedown=e=>e.preventDefault();
+    option.onclick=()=>selectRknnModel(m.code);
+    list.appendChild(option);
+  });
+}
+function openRknnModelPicker(showAll){
+  const list=document.getElementById('rknnModelOptions');
+  const search=document.getElementById('rknnModelSearch');
+  if(!list||!search)return;
+  if(showAll){
+    search.select();
+    renderRknnModelOptions();
+  }
+  list.hidden=false;
+  search.setAttribute('aria-expanded','true');
+}
+function hideRknnModelPicker(){
+  const list=document.getElementById('rknnModelOptions');
+  const search=document.getElementById('rknnModelSearch');
+  if(list)list.hidden=true;
+  if(search)search.setAttribute('aria-expanded','false');
+}
+function filterRknnModels(){
+  const search=document.getElementById('rknnModelSearch');
+  const sel=document.getElementById('rknnModelSel');
+  if(!search||!sel)return;
+  const selected=(window.__rknnModels||[]).find(m=>m.code===sel.value);
+  if(!selected||search.value!==rknnModelLabel(selected)){
+    sel.value='';
+    onRknnModelChange();
+  }
+  openRknnModelPicker(false);
+  renderRknnModelOptions(search.value);
+}
+function selectRknnModel(code,notify){
+  const model=(window.__rknnModels||[]).find(m=>m.code===code);
+  if(!model)return;
+  document.getElementById('rknnModelSel').value=model.code;
+  document.getElementById('rknnModelSearch').value=rknnModelLabel(model);
+  hideRknnModelPicker();
+  if(notify!==false)onRknnModelChange();
+}
+function onRknnSearchKeydown(e){
+  const list=document.getElementById('rknnModelOptions');
+  if(!list)return;
+  if(e.key==='Escape'||e.key==='Tab'){hideRknnModelPicker();if(e.key==='Escape')e.preventDefault();return;}
+  if(e.key==='Enter'){
+    const active=list.querySelector('.model-option.active');
+    if(active){selectRknnModel(active.dataset.code);e.preventDefault();}
+    return;
+  }
+  if(e.key!=='ArrowDown'&&e.key!=='ArrowUp')return;
+  e.preventDefault();
+  if(list.hidden)openRknnModelPicker(false);
+  const options=Array.from(list.querySelectorAll('.model-option'));
+  if(!options.length)return;
+  let next=window.__rknnActive;
+  next=e.key==='ArrowDown'?Math.min(next+1,options.length-1):Math.max(next-1,0);
+  if(window.__rknnActive<0)next=e.key==='ArrowDown'?0:options.length-1;
+  options.forEach(o=>o.classList.remove('active'));
+  options[next].classList.add('active');
+  options[next].scrollIntoView({block:'nearest'});
+  window.__rknnActive=next;
+}
+document.addEventListener('pointerdown',e=>{
+  if(!e.target.closest('#rknnModelPicker'))hideRknnModelPicker();
+});
 function onRknnModelChange(){
   const code=document.getElementById('rknnModelSel').value;
   const m=(window.__rknnModels||[]).find(x=>x.code===code);
