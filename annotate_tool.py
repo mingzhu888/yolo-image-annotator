@@ -314,6 +314,27 @@ def api_device():
     return jsonify(info)
 
 
+@app.route("/api/rknn/models")
+def api_rknn_models():
+    """代理 RKNN 服务的模型清单，供界面下拉选择（避免前端跨域）。"""
+    try:
+        d = _http_json(_rknn_base_url() + "/models", timeout=8)
+        models = []
+        for m in d.get("models", []):
+            models.append({
+                "code": m.get("code"),
+                "name": m.get("name") or m.get("code"),
+                "labels": m.get("labels") or [],
+                "input_size": m.get("input_size"),
+                "role": m.get("role"),
+            })
+        return jsonify({"ok": True, "url": _rknn_base_url(),
+                        "models": sorted(models, key=lambda x: x["code"] or "")})
+    except Exception as e:
+        return jsonify({"ok": False, "url": _rknn_base_url(),
+                        "msg": "RKNN 服务不可达: %s" % e, "models": []})
+
+
 @app.route("/api/vlm_config", methods=["GET", "POST"])
 def api_vlm_config():
     """读写多模态标注配置。api_key 只写不读，前端拿不到明文。"""
@@ -2464,6 +2485,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="hint">模型路径支持 <b>rknn://模型代码</b>；两级级联写 <b>rknn://yqzk_smoke?person=person_infra</b>。.rknn 只能在 RK3588 的 NPU 上执行，本机经 SSH 隧道访问该地址。</div>
+
+      <div class="grp" style="margin-top:12px">
+        <div class="gt">④ 一键 RKNN 标注（员工模式）</div>
+        <div class="inline">
+          <div class="field" style="flex:2">
+            <label>模型 <span id="rknnStatus" style="font-weight:400"></span></label>
+            <select id="rknnModelSel" onchange="onRknnModelChange()">
+              <option value="">（正在读取…）</option>
+            </select>
+          </div>
+          <div class="field" style="flex:1">
+            <label>置信度</label>
+            <input id="rknnConf" type="number" step="0.05" min="0" max="1" value="0.1">
+          </div>
+        </div>
+        <div class="hint" id="rknnModelHint" style="margin-top:6px"></div>
+        <div class="inline" style="align-items:center">
+          <button class="tbtn primary" id="rknnGoBtn" onclick="oneClickRknn()">一键开始标注</button>
+          <button class="tbtn" onclick="loadRknnModels()">刷新模型</button>
+        </div>
+      </div>
       <div class="hint">加载模型时会按类别名称自动匹配类别偏移（忽略大小写/下划线）；匹配不上可点卡片里的“自动匹配偏移”。同类别重叠框只保留置信度高的，不同类别（如安全帽 + 反光衣）同时保留。</div>
     </div>
 
@@ -2737,6 +2779,7 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   fillVlmFields(c.vlm||{});
   if(c.rknn_url)document.getElementById('rknnUrl').value=c.rknn_url;
   refreshDeviceInfo();
+  loadRknnModels();
   initModelSlots(c.models||[]);
   // 服务端可能还开着文件夹、甚至还有批量任务在跑，刷新页面不该把这些丢掉
   fetch('/api/files').then(r=>r.json()).then(d=>{
@@ -2808,6 +2851,88 @@ function saveRknnUrl(){
   const v=document.getElementById('rknnUrl').value.trim();
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({rknn_url:v})}).then(()=>st('RKNN 服务地址已保存'));
+}
+
+function loadRknnModels(){
+  const sel=document.getElementById('rknnModelSel');
+  const stEl=document.getElementById('rknnStatus');
+  if(!sel||!stEl)return Promise.resolve();
+  stEl.textContent='（读取中…）';stEl.style.color='var(--text-3)';
+  return fetch('/api/rknn/models').then(r=>r.json()).then(d=>{
+    window.__rknnModels=d.models||[];
+    if(!d.ok){
+      stEl.textContent='（设备离线）';stEl.style.color='#e5484d';
+      sel.innerHTML='<option value="">设备离线：检查隧道和服务</option>';
+      document.getElementById('rknnModelHint').textContent=d.msg||'';
+      return;
+    }
+    stEl.textContent='（在线 '+window.__rknnModels.length+' 个）';
+    stEl.style.color='var(--text-3)';
+    sel.innerHTML='<option value="">请选择模型…</option>'+
+      window.__rknnModels.map(m=>'<option value="'+m.code+'">'+
+        (m.name||m.code)+'　['+m.code+']</option>').join('');
+    document.getElementById('rknnModelHint').textContent='';
+  }).catch(()=>{stEl.textContent='（连接失败）';stEl.style.color='#e5484d';});
+}
+function onRknnModelChange(){
+  const code=document.getElementById('rknnModelSel').value;
+  const m=(window.__rknnModels||[]).find(x=>x.code===code);
+  const hint=document.getElementById('rknnModelHint');
+  if(!m){hint.textContent='';return;}
+  document.getElementById('classesIn').value=(m.labels||[]).join(',');
+  hint.innerHTML='类别已自动填入：<b>'+(m.labels||[]).join(' / ')+'</b>'+
+    '　输入 '+m.input_size+'　'+(m.role==='infra'?'裁块模型（建议级联）':'整帧模型');
+}
+async function oneClickRknn(){
+  const code=document.getElementById('rknnModelSel').value;
+  if(!code){alert('请先选择模型');return;}
+  const img_dir=document.getElementById('imgDir').value.trim();
+  const label_dir=document.getElementById('labelDir').value.trim();
+  const classes=document.getElementById('classesIn').value.split(',')
+      .map(s=>s.trim()).filter(Boolean);
+  const conf=parseFloat(document.getElementById('rknnConf').value)||0.1;
+  if(!img_dir){alert('请先选择图片文件夹');return;}
+  if(!classes.length){alert('类别为空：请重新选择模型');return;}
+  const btn=document.getElementById('rknnGoBtn');
+  btn.disabled=true;btn.textContent='准备中…';
+  try{
+    const o=await (await fetch('/api/open',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({img_dir,label_dir,classes})})).json();
+    if(!o.ok){alert(o.msg);return;}
+    total=o.count;idx=0;files=o.files;classes=o.classes.slice();
+    const cf=document.getElementById('curFolder');
+    if(cf){cf.textContent=o.img_dir||'';cf.title=o.img_dir||'';}
+    const cur=await (await fetch('/api/models')).json();
+    for(const m of (cur.models||[])){
+      await fetch('/api/unload_model',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:m.id})});
+    }
+    const l=await (await fetch('/api/load_model',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model_path:'rknn://'+code,conf})})).json();
+    if(!l.ok){alert('加载模型失败：'+l.msg);return;}
+    closeModal();
+    ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto',
+     'btnSplit','btnVlmAuto','btnVlmReview'].forEach(id=>{
+      const el=document.getElementById(id);if(el)el.disabled=false;});
+    buildClsBtns();buildFileList();load(0);
+    autoActive=true;
+    document.getElementById('autoIou').value='0.5';
+    document.getElementById('autoBar').style.width='0%';
+    document.getElementById('autoMsg').textContent='';
+    document.getElementById('autoSkip').checked=true;
+    openOverlay('autoMask');
+    document.getElementById('autoStartBtn').disabled=true;
+    document.getElementById('autoCancelBtn').disabled=false;
+    const r=await (await fetch('/api/auto_annotate',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({skip_labeled:true,iou:0.5})})).json();
+    if(!r.ok){alert(r.msg);return;}
+    pollAuto();
+  }catch(e){alert('出错：'+e);}
+  finally{btn.disabled=false;btn.textContent='一键开始标注';}
 }
 
 function fillVlmFields(v){
