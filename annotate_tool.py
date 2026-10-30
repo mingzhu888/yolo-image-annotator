@@ -275,7 +275,11 @@ def save_config(cfg):
 
 @app.route("/")
 def index():
-    return Response(HTML_PAGE, mimetype="text/html")
+    resp = Response(HTML_PAGE, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/config", methods=["GET", "POST"])
@@ -2367,10 +2371,22 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #dirtyTag{color:var(--orange);}
 
   /* 弹窗 */
-  #modalMask,#splitMask,#autoMask{position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:100;}
+  #modalMask,#splitMask,#autoMask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:100;}
   .mask-open{animation:maskIn .18s var(--ease-out);}
   .mask-close{animation:maskOut .14s var(--ease-out) forwards;}
-  .modal{width:560px;max-height:calc(100vh - 48px);overflow-y:auto;overscroll-behavior:contain;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius-xl);padding:20px;box-shadow:var(--shadow-lg);}
+  .modal{
+    width:min(560px,calc(100vw - 32px));
+    max-height:calc(100vh - 32px);
+    margin:auto;
+    flex:0 0 auto;
+    overflow-y:auto;
+    overscroll-behavior:contain;
+    background:var(--surface);
+    border:1px solid var(--border-strong);
+    border-radius:var(--radius-xl);
+    padding:20px;
+    box-shadow:var(--shadow-lg);
+  }
   .modal-in{animation:modalIn .2s var(--ease-out);}
   .modal-out{animation:modalOut .14s var(--ease-out) forwards;}
   .modal h2{margin:0 0 2px;font-size:16px;font-weight:600;letter-spacing:-.01em;}
