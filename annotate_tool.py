@@ -483,6 +483,45 @@ def api_pick_folder():
     return jsonify({"ok": True, "path": path})
 
 
+def _folder_roots():
+    if os.name == "nt":
+        return [f"{letter}:\\" for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                if os.path.isdir(f"{letter}:\\")]
+    return ["/"]
+
+
+@app.route("/api/browse_folders")
+def api_browse_folders():
+    """网页内文件夹浏览，避免后台进程弹系统对话框时被隐藏。"""
+    raw = (request.args.get("path") or "").strip().strip('"')
+    roots = _folder_roots()
+    if not raw or not os.path.isdir(raw):
+        return jsonify({"ok": True, "current": "", "parent": None,
+                        "roots": roots, "dirs": [],
+                        "msg": "请选择磁盘" if not raw else "路径不存在，请重新选择"})
+
+    current = os.path.abspath(os.path.expanduser(raw))
+    parent = os.path.dirname(current.rstrip("\\/"))
+    if os.path.normcase(parent) == os.path.normcase(current):
+        parent = None
+    folders = []
+    try:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        folders.append({"name": entry.name, "path": entry.path})
+                except OSError:
+                    continue
+    except (OSError, PermissionError) as exc:
+        return jsonify({"ok": False, "current": current, "parent": parent,
+                        "roots": roots, "dirs": [],
+                        "msg": "无法读取该文件夹: %s" % exc})
+    folders.sort(key=lambda item: item["name"].casefold())
+    return jsonify({"ok": True, "current": current, "parent": parent,
+                    "roots": roots, "dirs": folders, "msg": ""})
+
+
 def _model_device_str(m):
     """模型实际跑在哪个设备上（给界面显示）。"""
     try:
@@ -2358,7 +2397,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   #dirtyTag{color:var(--orange);}
 
   /* 弹窗 */
-  #modalMask,#splitMask,#autoMask{position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:100;}
+  #modalMask,#splitMask,#autoMask,#folderMask{position:fixed;inset:0;background:rgba(0,0,0,.5);align-items:center;justify-content:center;z-index:100;}
+  #folderMask{z-index:130;}
   .mask-open{animation:maskIn .18s var(--ease-out);}
   .mask-close{animation:maskOut .14s var(--ease-out) forwards;}
   .modal{width:560px;max-height:calc(100vh - 48px);overflow-y:auto;overscroll-behavior:contain;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--radius-xl);padding:20px;box-shadow:var(--shadow-lg);}
@@ -2374,6 +2414,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .grp{border:1px solid var(--border);border-radius:var(--radius-l);padding:12px;margin-top:12px;background:var(--inset);}
   .grp .gt{font-size:12px;color:var(--text);margin-bottom:8px;font-weight:600;}
   .inline{display:flex;gap:10px;} .inline>div{flex:1;}
+  .folder-path{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+  .folder-path input{min-width:0;flex:1;background:var(--inset);color:var(--text-2);}
+  .folder-list{height:min(48vh,340px);overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-m);background:var(--inset);padding:4px;}
+  .folder-row{display:flex;align-items:center;width:100%;height:36px;padding:0 10px;border-radius:var(--radius-s);text-align:left;font-size:13px;color:var(--text);}
+  .folder-row:hover,.folder-row:focus{background:var(--surface-3);}
+  .folder-row .icon{width:22px;color:var(--orange);flex:0 0 auto;}
+  .folder-row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .folder-empty{padding:28px 10px;text-align:center;font-size:12px;color:var(--text-3);line-height:1.6;}
 
   @keyframes maskIn{from{opacity:0}to{opacity:1}}
   @keyframes maskOut{from{opacity:1}to{opacity:0}}
@@ -2562,6 +2610,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="actions">
       <button class="tbtn" onclick="closeModal()">取消</button>
       <button class="tbtn primary" onclick="openFolder()">打开文件夹</button>
+    </div>
+  </div>
+</div>
+
+<!-- 文件夹浏览 -->
+<div id="folderMask" style="display:none">
+  <div class="modal">
+    <h2>选择文件夹</h2>
+    <div class="sub">双击文件夹进入，选中当前目录后点“选择此文件夹”</div>
+    <div class="folder-path">
+      <button class="tbtn" id="folderUpBtn" type="button" onclick="folderGoUp()">上一级</button>
+      <input id="folderPath" type="text" readonly>
+    </div>
+    <div class="folder-list" id="folderList"></div>
+    <div class="actions">
+      <button class="tbtn" type="button" onclick="closeFolderBrowser()">取消</button>
+      <button class="tbtn primary" id="folderChooseBtn" type="button"
+              onclick="chooseCurrentFolder()" disabled>选择此文件夹</button>
     </div>
   </div>
 </div>
@@ -2755,14 +2821,83 @@ function pickFile(cb){
     else if(d&&d.msg)alert(d.msg);
   });
 }
-function pickFolder(cb){
-  fetch('/api/pick_folder',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.ok&&d.path)cb(d.path);
-    else if(d&&d.msg)alert(d.msg);
+let folderPickCallback=null;
+let folderBrowserState={current:'',parent:null,roots:[],dirs:[]};
+function pickFolder(cb,startPath){
+  folderPickCallback=cb;
+  openOverlay('folderMask');
+  loadFolderBrowser(startPath||'');
+}
+function pickImgDir(){
+  pickFolder(p=>{document.getElementById('imgDir').value=p;},
+             document.getElementById('imgDir').value.trim());
+}
+function pickLabelDir(){
+  pickFolder(p=>{document.getElementById('labelDir').value=p;},
+             document.getElementById('labelDir').value.trim());
+}
+function folderRow(icon,label,path){
+  const row=document.createElement('button');
+  row.type='button';row.className='folder-row';
+  const ic=document.createElement('span');
+  ic.className='icon';ic.textContent=icon;
+  const name=document.createElement('span');
+  name.className='name';name.textContent=label;
+  row.append(ic,name);
+  row.onclick=()=>loadFolderBrowser(path);
+  return row;
+}
+function renderFolderBrowser(d){
+  const list=document.getElementById('folderList');
+  list.replaceChildren();
+  if((d.roots||[]).length){
+    d.roots.forEach(root=>list.appendChild(folderRow('▣','磁盘 '+root,root)));
+  }
+  if(d.current && (d.roots||[]).length){
+    const split=document.createElement('div');
+    split.style.cssText='height:1px;background:var(--border);margin:4px 6px;';
+    list.appendChild(split);
+  }
+  (d.dirs||[]).forEach(item=>list.appendChild(folderRow('▸',item.name,item.path)));
+  if(d.msg||!((d.roots||[]).length||(d.dirs||[]).length)){
+    const empty=document.createElement('div');
+    empty.className='folder-empty';
+    empty.textContent=d.msg||'这个文件夹里没有子文件夹';
+    list.appendChild(empty);
+  }
+}
+function loadFolderBrowser(path){
+  const list=document.getElementById('folderList');
+  const pathInput=document.getElementById('folderPath');
+  const choose=document.getElementById('folderChooseBtn');
+  list.innerHTML='<div class="folder-empty">正在读取…</div>';
+  fetch('/api/browse_folders?path='+encodeURIComponent(path||'')).then(r=>r.json()).then(d=>{
+    folderBrowserState=d;
+    pathInput.value=d.current||'请选择磁盘';
+    document.getElementById('folderUpBtn').disabled=!d.parent;
+    choose.disabled=!d.current;
+    renderFolderBrowser(d);
+  }).catch(()=>{
+    folderBrowserState={current:'',parent:null,roots:[],dirs:[]};
+    pathInput.value='读取失败';
+    choose.disabled=true;
+    list.innerHTML='<div class="folder-empty">无法连接标注工具，请刷新页面后重试</div>';
   });
 }
-function pickImgDir(){pickFolder(p=>{document.getElementById('imgDir').value=p;});}
-function pickLabelDir(){pickFolder(p=>{document.getElementById('labelDir').value=p;});}
+function folderGoUp(){
+  if(folderBrowserState.parent)loadFolderBrowser(folderBrowserState.parent);
+}
+function chooseCurrentFolder(){
+  const path=folderBrowserState.current;
+  if(!path)return;
+  const cb=folderPickCallback;
+  closeFolderBrowser();
+  if(cb)cb(path);
+}
+function closeFolderBrowser(){
+  folderPickCallback=null;
+  closeOverlay('folderMask');
+}
 
 function snap(){
   undoStack.push(JSON.parse(JSON.stringify(boxes)));
