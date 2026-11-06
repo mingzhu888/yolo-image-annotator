@@ -1,6 +1,6 @@
-# YOLO 标注工具（YOLO Image Annotator）
+# 云企智瞰标注工具（YOLO Image Annotator）
 
-一个运行在本机的 YOLO 检测图片标注工具：Flask 后端 + 浏览器前端，深色中文界面，无需前端构建。支持手动标注、模型辅助标注、类别过滤、预测去重、数据集自动划分与图片去重，适合个人和小团队快速完成标注并进入训练循环。
+一个运行在本机的 YOLO 检测图片标注工具：Flask 后端 + WebView2 桌面窗口，深色中文界面。支持手动标注、模型辅助标注、类别过滤、预测去重、数据集自动划分与图片去重，适合个人和小团队快速完成标注并进入训练循环。
 
 ## 特色功能
 
@@ -110,6 +110,14 @@ python --version
    - 自动使用虚拟环境运行，浏览器会自动打开 `http://127.0.0.1:5000`
 4. 关闭黑色终端窗口即退出工具
 
+### Windows 安装包
+
+也可以直接运行 `云企智瞰标注工具_安装程序_1.2.1.exe`。安装向导支持选择安装目录、
+创建桌面快捷方式，并自动检查 WebView2 和 Visual C++ 运行库。安装完成后从桌面或开始菜单
+启动，不会打开浏览器或额外的终端窗口。
+
+用户配置保存在 `%LOCALAPPDATA%\YunqiZhikanAnnotator`。
+
 ### 方式二：手动安装（Windows / macOS / Linux）
 
 ```bash
@@ -152,15 +160,18 @@ build_exe.bat
 输出目录：
 
 ```text
-dist\YOLO标注工具\
-├── YOLO标注工具.exe
+dist\云企智瞰标注工具\
+├── 云企智瞰标注工具.exe
 ├── _internal\
 └── annotate_config.json  # 首次运行后生成
 ```
 
 采用 `onedir` 而不是单文件，原因是本地 YOLO 依赖 PyTorch/CUDA，单文件每次启动都要
 解压大量 DLL，速度慢且更容易被杀毒软件拦截。发布时请分发整个
-`dist\YOLO标注工具` 文件夹。
+`dist\云企智瞰标注工具` 文件夹。
+
+如需生成安装程序，先完成 EXE 构建，再运行 `build_installer.bat`。安装包输出到
+`installer\output`。
 
 ### 没有 GPU / 想省空间：只装 CPU 版 PyTorch
 

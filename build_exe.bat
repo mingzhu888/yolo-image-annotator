@@ -20,7 +20,7 @@ if errorlevel 1 goto :failed
 
 echo.
 echo Build complete:
-echo dist\YOLO标注工具\YOLO标注工具.exe
+echo dist\云企智瞰标注工具\云企智瞰标注工具.exe
 pause
 exit /b 0
 

@@ -4,8 +4,11 @@ __pycache__/
 venv/
 .pytest_cache/
 annotate_config.json
+desktop_error.log
 build/
 dist/
+installer/output/
+installer/redist/
 backup/
 .DS_Store
 Thumbs.db

@@ -125,9 +125,15 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def runtime_dir():
-    """源码运行时用脚本目录；EXE 运行时用 EXE 所在目录。"""
+    """源码运行时用脚本目录；安装版使用当前用户的本地应用数据目录。"""
+    custom = os.environ.get("YOLO_ANNOTATOR_DATA_DIR")
+    if custom:
+        return Path(custom)
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "YunqiZhikanAnnotator"
+        return Path.home() / "AppData" / "Local" / "YunqiZhikanAnnotator"
     return Path(__file__).resolve().parent
 
 
@@ -2043,7 +2049,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>YOLO 标注工具</title>
+<title>云企智瞰标注工具</title>
 <style>
   :root{
     --bg:#0d0d0f; --surface:#151518; --surface-2:#1c1c20; --surface-3:#26262b;
@@ -2228,7 +2234,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
 
 <div id="topbar">
-  <div class="logo"><span class="dot"></span>YOLO 标注工具 <span style="font-size:11px;color:var(--text-3)">v1.1</span></div>
+  <div class="logo"><span class="dot"></span>云企智瞰标注工具 <span style="font-size:11px;color:var(--text-3)">v1.2.1</span></div>
   <span id="curFolder" style="font-size:12px;color:var(--text-3);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=""></span>
   <button class="tbtn" onclick="openModal()">配置</button>
   <button class="tbtn ghost" id="themeBtn" onclick="toggleTheme()" title="切换深色 / 浅色">浅色</button>

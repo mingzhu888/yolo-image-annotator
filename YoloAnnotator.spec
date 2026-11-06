@@ -1,14 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 hiddenimports = collect_submodules("ultralytics")
-datas = collect_data_files("ultralytics")
+webview_datas, webview_binaries, webview_hiddenimports = collect_all("webview")
+hiddenimports += webview_hiddenimports + ["clr", "pythonnet", "clr_loader"]
 
 a = Analysis(
-    ["annotate_tool.py"],
+    ["desktop_app.py"],
     pathex=[],
-    binaries=[],
-    datas=datas,
+    binaries=webview_binaries,
+    datas=webview_datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -29,12 +30,13 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="YOLO标注工具",
+    name="云企智瞰标注工具",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,
+    console=False,
+    icon="assets/yunqi-zhikan-annotator.ico",
 )
 coll = COLLECT(
     exe,
@@ -43,5 +45,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="YOLO标注工具",
+    name="云企智瞰标注工具",
 )
