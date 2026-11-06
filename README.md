@@ -60,26 +60,6 @@
 
 批量标注会复用每个模型的类别过滤与置信度设置，跨模型做 NMS 去重后写入标签文件。
 
-### 多模态标注（云端大模型）
-
-不训练任何模型，直接让多模态大模型按类别名读图出框。适合零标注冷启动，或给已有模型补漏。
-
-1. 配置里填接口地址、模型名、API Key（并发数默认 4）
-2. 打开文件夹并填好类别名，例如 `helmet,no-helmet(头部),vest,no-vest(躯干)`
-3. 点顶部「多模态标注」，先「用当前图试一张」，确认后可「开始多模态标注」
-
-类别名后面可以用括号给一个**定位提示**，写法 `类别名(提示)`，例如 `no-helmet(头部),灭火器`。提示只进提示词、只决定框在哪里，不会进类别名，也不会影响类别 ID。像 `no-helmet`、`未系安全带` 这种"缺少某物"的状态类，模型本来没有可指的物体，提示一个具体部位能明显稳住框的位置。
-
-要点：
-
-- 走标准 `chat/completions`，任何 OpenAI 兼容接口都能用，不绑定厂商。图片以 base64 内联，不需要图床。
-- 只依赖 Python 标准库，装了 flask + pillow 即可用。
-- 配置只存本机 `annotate_config.json`（已在 `.gitignore`），Key 不回传浏览器，也可用环境变量 `VLM_API_KEY` 覆盖。
-- **空结果默认不写标签。** 大模型会静默漏标，写成负样本后就分不出「没检出」和「确实没有目标」。确认要负样本可关掉该开关。
-- **接口报错算失败**，不会写成空标签文件。
-
-**这是草稿，不是成品标签。** 同一张图多次调用，输出的类别集合会变（例如某次漏掉 `no-vest`），框也比专门训练的检测器松。务必逐张复核。
-
 ### 数据集自动划分
 
 一键把当前图片 + 标签随机划分为 `train / val`，并生成标准 `data.yaml`：
@@ -156,6 +136,31 @@ python annotate_tool.py
 ```
 
 浏览器会自动打开 `http://127.0.0.1:5000`，关闭终端窗口即退出。
+
+### 打包为 Windows EXE
+
+仓库提供 `build_exe.bat` 和 `YoloAnnotator.spec`。默认使用
+`F:\miniconda\envs\yolo_4060\python.exe`，该环境需要安装
+`torch`、`ultralytics`、`opencv` 和 Flask。
+
+双击 `build_exe.bat`，或在命令行执行：
+
+```bat
+build_exe.bat
+```
+
+输出目录：
+
+```text
+dist\YOLO标注工具\
+├── YOLO标注工具.exe
+├── _internal\
+└── annotate_config.json  # 首次运行后生成
+```
+
+采用 `onedir` 而不是单文件，原因是本地 YOLO 依赖 PyTorch/CUDA，单文件每次启动都要
+解压大量 DLL，速度慢且更容易被杀毒软件拦截。发布时请分发整个
+`dist\YOLO标注工具` 文件夹。
 
 ### 没有 GPU / 想省空间：只装 CPU 版 PyTorch
 
@@ -250,6 +255,9 @@ yolo-image-annotator/
 ├── annotate_tool.py        # 主程序（Flask + 内嵌前端）
 ├── requirements.txt        # 轻量依赖（手动标注）
 ├── requirements-full.txt   # 完整依赖（含模型辅助标注）
+├── requirements-build.txt  # EXE 打包依赖
+├── build_exe.bat           # Windows EXE 构建脚本
+├── YoloAnnotator.spec      # PyInstaller 打包配置
 ├── install_deps.bat        # Windows 一键安装依赖
 ├── start.bat               # Windows 一键启动
 ├── _dedup.py               # 字节级去重工具
@@ -265,10 +273,8 @@ yolo-image-annotator/
 python tests/test_predict_filter.py
 python tests/test_save_validation.py
 python tests/test_auto_annotate.py
-python tests/test_vlm_annotate.py
+python tests/test_core.py
 ```
-
-`test_vlm_annotate.py` 不联网，用 fake 的接口响应验证类别映射、坐标换算，以及「空结果 / 接口报错不落盘」几条策略。
 
 ## 常见问题
 

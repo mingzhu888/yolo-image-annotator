@@ -18,6 +18,7 @@ import re
 import sys
 import json
 import math
+import multiprocessing
 import socket
 import subprocess
 import threading
@@ -82,9 +83,7 @@ def _pid_commandline(pid):
 
 
 def free_port_if_stale(port):
-    """启动前:若端口被旧实例(僵死或正常)占用,清掉它,保证本次是全新实例。
-    只杀“命令行里包含 annotate_tool”的 python 进程,避免误伤其它服务。
-    返回 True 表示端口现在可用。"""
+    """启动前清理本工具的旧实例，不误伤其它程序。"""
     if not _port_in_use(port) and not _pids_listening_on(port):
         return True
     pids = _pids_listening_on(port)
@@ -100,13 +99,14 @@ def free_port_if_stale(port):
                 text=True, errors="ignore").lower()
         except Exception:
             info = ""
-        if "python" not in info:
-            print(f"  [警告] 端口 {port} 被非 python 进程(PID {pid})占用,"
-                  f"未自动清理。请手动关闭它后重试。")
-            return False
         cmd = _pid_commandline(pid)
-        if "annotate_tool" not in cmd:
-            print(f"  [警告] 端口 {port} 的 python 进程(PID {pid})不是本工具"
+        if getattr(sys, "frozen", False):
+            exe_name = os.path.basename(sys.executable).lower()
+            is_ours = exe_name in info or exe_name in cmd
+        else:
+            is_ours = "python" in info and "annotate_tool" in cmd
+        if not is_ours:
+            print(f"  [警告] 端口 {port} 的进程(PID {pid})不是本工具"
                   f"({cmd.strip()[:80] or '无法读取命令行'}),未自动清理。")
             return False
         print(f"  检测到旧的标注工具实例(PID {pid})仍占用端口 {port},正在关闭它...")
@@ -122,14 +122,22 @@ def free_port_if_stale(port):
 
 app = Flask(__name__)
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "annotate_config.json")
+
+
+def runtime_dir():
+    """源码运行时用脚本目录；EXE 运行时用 EXE 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+CONFIG_FILE = str(runtime_dir() / "annotate_config.json")
 
 STATE = {
     "img_dir": None,
     "label_dir": None,
     "images": [],
     "classes": [],
-    "class_hints": {},   # 可选：{类别名: 定位提示}，只用于多模态提示词
     "models": [],        # 已加载的模型列表 [{id,name,path,model,model_classes,cls_offset,conf,only_cls}]
     "auto": None,        # 自动化标注进度
 }
@@ -293,13 +301,7 @@ def api_config():
         if "rknn_url" in data:
             cfg["rknn_url"] = str(data.get("rknn_url") or "").strip()
         save_config(cfg)
-    cfg = dict(load_config())
-    v = dict(cfg.get("vlm") or {})
-    if v.get("api_key"):
-        v["has_key"] = True
-        v["api_key"] = ""      # 不回传明文 key 给浏览器
-    cfg["vlm"] = v
-    return jsonify(cfg)
+    return jsonify(dict(load_config()))
 
 
 @app.route("/api/device")
@@ -339,65 +341,6 @@ def api_rknn_models():
                         "msg": "RKNN 服务不可达: %s" % e, "models": []})
 
 
-@app.route("/api/vlm_config", methods=["GET", "POST"])
-def api_vlm_config():
-    """读写多模态标注配置。api_key 只写不读，前端拿不到明文。"""
-    if request.method == "GET":
-        v = dict(vlm_config())
-        if v.get("api_key"):
-            v["has_key"] = True
-            v["api_key"] = ""
-        return jsonify({"ok": True, "vlm": v})
-    data = request.get_json() or {}
-    patch = {}
-    for k in ("base_url", "model"):
-        if data.get(k) is not None:
-            patch[k] = str(data[k]).strip()
-    if data.get("api_key"):
-        patch["api_key"] = str(data["api_key"]).strip()
-    if data.get("clear_key"):
-        patch["api_key"] = ""
-    if data.get("thinking") is not None:
-        patch["thinking"] = bool(data["thinking"])
-    if data.get("concurrency") is not None:
-        try:
-            patch["concurrency"] = max(1, min(32, int(data["concurrency"])))
-        except (TypeError, ValueError):
-            pass
-    v = save_vlm_config(patch)
-    out = dict(v)
-    if out.get("api_key"):
-        out["has_key"] = True
-        out["api_key"] = ""
-    return jsonify({"ok": True, "vlm": out})
-
-
-@app.route("/api/vlm_test", methods=["POST"])
-def api_vlm_test():
-    """对指定图片跑一次多模态标注，只返回结果供预览，不写标签文件。"""
-    if not STATE["img_dir"] or not STATE["images"]:
-        return jsonify({"ok": False, "msg": "请先打开图片文件夹"})
-    if not STATE["classes"]:
-        return jsonify({"ok": False, "msg": "请先填写类别名"})
-    data = request.get_json() or {}
-    try:
-        idx = int(data.get("idx", -1))
-    except (TypeError, ValueError):
-        idx = -1
-    if idx < 0 or idx >= len(STATE["images"]):
-        return jsonify({"ok": False, "msg": "图片下标越界"})
-    iou = float(data.get("iou") or 0.5)
-    path = os.path.join(STATE["img_dir"], STATE["images"][idx])
-    boxes, stats = _predict_vlm(path, iou)
-    if stats and stats[0].get("error"):
-        return jsonify({"ok": False, "msg": stats[0]["error"]})
-    return jsonify({"ok": True,
-                    "boxes": [{"cls": b["cls"], "cx": b["cx"], "cy": b["cy"],
-                               "w": b["w"], "h": b["h"],
-                               "label": STATE["classes"][b["cls"]]} for b in boxes],
-                    "stats": stats})
-
-
 @app.route("/api/open", methods=["POST"])
 def api_open():
     data = request.get_json()
@@ -419,16 +362,8 @@ def api_open():
     STATE["label_dir"] = label_dir
     STATE["images"] = imgs
     if classes:
-        names, hints = [], {}
-        for item in classes:
-            nm, hint = _parse_class_spec(item)
-            if not nm:
-                continue
-            names.append(nm)
-            if hint:
-                hints[nm] = hint
-        STATE["classes"] = names
-        STATE["class_hints"] = hints
+        STATE["classes"] = [nm for nm, _ in
+                            (_parse_class_spec(item) for item in classes) if nm]
 
     cfg = load_config()
     cfg.update({"img_dir": img_dir, "label_dir": label_dir,
@@ -957,7 +892,7 @@ def _infer_rknn_remote(entry, img_path, conf):
     classes = STATE["classes"]
     out, unmapped = [], 0
     for b in d.get("boxes", []):
-        cls = _vlm_map_label(b.get("label"), classes)
+        cls = _map_label_name(b.get("label"), classes)
         if cls is None:
             unmapped += 1
             continue
@@ -1102,6 +1037,41 @@ def _infer_meituan(model, img_path, conf):
 def _norm_cls_name(s):
     """类别名归一化:去掉空格/下划线/连字符并转小写。"""
     return re.sub(r"[\s_\-]+", "", str(s)).lower()
+
+
+def _map_label_name(label, classes):
+    """把模型类别名映射到数据集类别下标；匹配不上则返回 None。"""
+    if label is None:
+        return None
+    if isinstance(label, int):
+        return label if 0 <= label < len(classes) else None
+    s = _norm_cls_name(label)
+    if not s:
+        return None
+    dmap = {}
+    for i, c in enumerate(classes):
+        key = _norm_cls_name(c)
+        if key and key not in dmap:
+            dmap[key] = i
+    if s in dmap:
+        return dmap[s]
+    best_i, best_len = None, 0
+    for key, i in dmap.items():
+        if len(key) >= 3 and key in s and len(key) > best_len:
+            best_i, best_len = i, len(key)
+    return best_i
+
+
+_CLASS_HINT_RE = re.compile(r"^\s*([^（()）]+?)\s*[（(]\s*([^（()）]+?)\s*[)）]\s*$")
+
+
+def _parse_class_spec(raw):
+    """兼容旧配置中的“类别(提示)”写法，只保留类别名。"""
+    s = str(raw).strip()
+    m = _CLASS_HINT_RE.match(s)
+    if m and m.group(1).strip():
+        return m.group(1).strip(), m.group(2).strip()
+    return s, None
 
 
 def _suggest_offset(model_classes, dataset_classes):
@@ -1907,13 +1877,7 @@ def _dedupe_with_existing(existing, preds, iou_thr):
 @app.route("/api/auto_annotate", methods=["POST"])
 def api_auto_annotate():
     data = request.get_json() or {}
-    use_vlm = bool(data.get("vlm"))
-    if use_vlm:
-        if not STATE["classes"]:
-            return jsonify({"ok": False, "msg": "请先填写类别名"})
-        if not vlm_config()["api_key"]:
-            return jsonify({"ok": False, "msg": "未配置多模态 API Key"})
-    elif not STATE["models"]:
+    if not STATE["models"]:
         return jsonify({"ok": False, "msg": "未加载任何模型"})
     if not STATE["img_dir"]:
         return jsonify({"ok": False, "msg": "请先打开图片文件夹"})
@@ -1923,25 +1887,21 @@ def api_auto_annotate():
     if st and st.get("running"):
         return jsonify({"ok": False, "msg": "自动化标注已在运行中"})
     skip_labeled = bool(data.get("skip_labeled", True))
-    skip_empty = bool(data.get("skip_empty", False)) and use_vlm
     iou_thr = float(data.get("iou", 0.5) or 0.5)
     threading.Thread(target=_auto_worker,
-                     args=(skip_labeled, iou_thr, use_vlm, skip_empty),
+                     args=(skip_labeled, iou_thr),
                      daemon=True).start()
     return jsonify({"ok": True})
 
 
-def _auto_worker(skip_labeled, iou_thr, use_vlm=False, skip_empty=False):
+def _auto_worker(skip_labeled, iou_thr):
     total = len(STATE["images"])
     st = {"running": True, "finished": False, "cancel": False,
           "total": total, "done": 0, "saved": 0, "skipped": 0,
-          "failed": 0, "empty": 0, "mode": "vlm" if use_vlm else "models",
+          "failed": 0, "empty": 0, "mode": "models",
           "errors": [], "current": "", "percent": 0}
     STATE["auto"] = st
     lock = threading.Lock()
-    vcfg = vlm_config() if use_vlm else None
-    # ultralytics 模型不是线程安全的，只有纯多模态这一路才并发
-    workers = max(1, int(vcfg["concurrency"])) if use_vlm else 1
 
     def handle(name):
         with lock:
@@ -1955,20 +1915,9 @@ def _auto_worker(skip_labeled, iou_thr, use_vlm=False, skip_empty=False):
                     st["skipped"] += 1
                 return
             path = os.path.join(STATE["img_dir"], name)
-            if use_vlm:
-                preds, stats = _predict_vlm(path, iou_thr, vcfg=vcfg)
-                if stats and stats[0].get("error"):
-                    raise RuntimeError(stats[0]["error"])
-            else:
-                preds, _ = _predict_all(path, iou_thr)
+            preds, _ = _predict_all(path, iou_thr)
             existing = _read_label_boxes(lp)
             merged = _dedupe_with_existing(existing, preds, iou_thr)
-            # 多模态会静默漏标。空结果若当负样本写下去,
-            # "没检出" 和 "确实没有目标" 就分不开了, 复查时无从发现。
-            if skip_empty and not merged:
-                with lock:
-                    st["empty"] += 1
-                return
             _write_label_file(lp, merged)
             with lock:
                 st["saved"] += 1
@@ -1983,13 +1932,8 @@ def _auto_worker(skip_labeled, iou_thr, use_vlm=False, skip_empty=False):
                 st["percent"] = round(st["done"] / total * 100, 1) if total else 100
 
     try:
-        if workers > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                list(ex.map(handle, list(STATE["images"])))
-        else:
-            for name in list(STATE["images"]):
-                handle(name)
+        for name in list(STATE["images"]):
+            handle(name)
         st["running"] = False
         st["finished"] = True
     except Exception as e:
@@ -2013,160 +1957,6 @@ def api_auto_cancel():
     if st:
         st["cancel"] = True
     return jsonify({"ok": True})
-
-
-def _review_worker(vcfg, opts):
-    """批量复核：对每张已有标签的图，把它的框逐个交给多模态改类别或删除。"""
-    total = len(STATE["images"])
-    st = {"running": True, "finished": False, "cancel": False,
-          "total": total, "done": 0, "saved": 0, "skipped": 0,
-          "failed": 0, "empty": 0, "unchanged": 0, "mode": "review",
-          "changed": 0, "reclassed": 0, "dropped": 0,
-          "changes": [], "errors": [], "current": "", "percent": 0}
-    STATE["auto"] = st
-    lock = threading.Lock()
-    workers = max(1, int(vcfg["concurrency"]))
-    hints = STATE.get("class_hints") or {}
-    classes = STATE["classes"]
-    drop_allowed = bool(opts.get("drop_allowed", True))
-    dry_run = bool(opts.get("dry_run", True))
-    proposals = {}
-    STATE["review_proposals"] = proposals
-
-    def handle(name):
-        with lock:
-            if st["cancel"]:
-                return
-            st["current"] = name
-        lp = label_path_for(name)
-        try:
-            boxes = _read_label_boxes(lp)
-            if not boxes:
-                with lock:
-                    st["skipped"] += 1
-                return
-            path = os.path.join(STATE["img_dir"], name)
-            verdicts, meta = _vlm_review_image(
-                path, boxes, classes, vcfg, hints, drop_allowed)
-            if meta.get("error"):
-                raise RuntimeError(meta["error"])
-            new_boxes, changes = _apply_review(boxes, verdicts, classes)
-            with lock:
-                if changes:
-                    if not dry_run:
-                        _write_label_file(lp, new_boxes)
-                    else:
-                        proposals[name] = new_boxes
-                    st["saved"] += 1
-                    st["changed"] += len(changes)
-                    st["reclassed"] += sum(1 for c in changes
-                                           if c["action"] == "reclass")
-                    st["dropped"] += sum(1 for c in changes
-                                         if c["action"] == "drop")
-                    for c in changes:
-                        if len(st["changes"]) < 300:
-                            c2 = dict(c)
-                            c2["file"] = name
-                            st["changes"].append(c2)
-                else:
-                    st["unchanged"] += 1
-        except Exception as e:
-            with lock:
-                st["failed"] += 1
-                if len(st["errors"]) < 20:
-                    st["errors"].append("%s: %s" % (name, e))
-        finally:
-            with lock:
-                st["done"] += 1
-                st["percent"] = round(st["done"] / total * 100, 1) if total else 100
-
-    try:
-        if workers > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                list(ex.map(handle, list(STATE["images"])))
-        else:
-            for name in list(STATE["images"]):
-                handle(name)
-        st["running"] = False
-        st["finished"] = True
-    except Exception as e:
-        st["running"] = False
-        st["finished"] = True
-        st["errors"].append(str(e))
-
-
-@app.route("/api/vlm_review", methods=["POST"])
-def api_vlm_review():
-    """启动批量多模态复核（只改类别或删除，不新增框）。"""
-    if not STATE["img_dir"] or not STATE["images"]:
-        return jsonify({"ok": False, "msg": "请先打开图片文件夹"})
-    if not STATE["classes"]:
-        return jsonify({"ok": False, "msg": "请先填写类别名"})
-    v = vlm_config()
-    if not (v["api_key"] and v["base_url"] and v["model"]):
-        return jsonify({"ok": False, "msg": "多模态接口未配置完整（地址/模型名/Key）"})
-    st = STATE.get("auto")
-    if st and st.get("running"):
-        return jsonify({"ok": False, "msg": "已有任务在运行中"})
-    data = request.get_json() or {}
-    opts = {"drop_allowed": bool(data.get("drop_allowed", True)),
-            "dry_run": bool(data.get("dry_run", True))}
-    threading.Thread(target=_review_worker, args=(v, opts), daemon=True).start()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/vlm_review_apply", methods=["POST"])
-def api_vlm_review_apply():
-    """把上一次复核产生的修改建议真正写进标签文件。"""
-    props = STATE.get("review_proposals") or {}
-    st = STATE.get("auto")
-    if st and st.get("running"):
-        return jsonify({"ok": False, "msg": "复核还在运行，等它跑完再应用"})
-    if not props:
-        return jsonify({"ok": False, "msg": "没有待应用的修改建议"})
-    n = 0
-    errs = []
-    for name, boxes in list(props.items()):
-        try:
-            _write_label_file(label_path_for(name), boxes)
-            n += 1
-        except Exception as e:
-            errs.append("%s: %s" % (name, e))
-    STATE["review_proposals"] = {}
-    return jsonify({"ok": True, "applied": n, "errors": errs[:5]})
-
-
-@app.route("/api/vlm_review_test", methods=["POST"])
-def api_vlm_review_test():
-    """对当前图做一次复核预览：返回将要发生的修改，不写盘。"""
-    if not STATE["img_dir"] or not STATE["images"]:
-        return jsonify({"ok": False, "msg": "请先打开图片文件夹"})
-    data = request.get_json() or {}
-    try:
-        idx = int(data.get("idx", -1))
-    except (TypeError, ValueError):
-        idx = -1
-    if idx < 0 or idx >= len(STATE["images"]):
-        return jsonify({"ok": False, "msg": "图片下标越界"})
-    name = STATE["images"][idx]
-    boxes = _read_label_boxes(label_path_for(name))
-    if not boxes:
-        return jsonify({"ok": False, "msg": "当前图没有已标注的框"})
-    v = vlm_config()
-    if not (v["api_key"] and v["base_url"] and v["model"]):
-        return jsonify({"ok": False, "msg": "多模态接口未配置完整"})
-    path = os.path.join(STATE["img_dir"], name)
-    verdicts, meta = _vlm_review_image(
-        path, boxes, STATE["classes"], v,
-        STATE.get("class_hints") or {},
-        bool(data.get("drop_allowed", True)))
-    if meta.get("error"):
-        return jsonify({"ok": False, "msg": meta["error"]})
-    new_boxes, changes = _apply_review(boxes, verdicts, STATE["classes"])
-    return jsonify({"ok": True, "changes": changes,
-                    "kept": len(new_boxes), "total": len(boxes),
-                    "unparsed": meta.get("unparsed", 0)})
 
 
 @app.route("/api/split", methods=["POST"])
@@ -2399,6 +2189,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .grp{border:1px solid var(--border);border-radius:var(--radius-l);padding:12px;margin-top:12px;background:var(--inset);}
   .grp .gt{font-size:12px;color:var(--text);margin-bottom:8px;font-weight:600;}
   .inline{display:flex;gap:10px;} .inline>div{flex:1;}
+  .config-modal{width:min(920px,calc(100vw - 32px));max-height:calc(100vh - 32px);padding:0;display:flex;flex-direction:column;overflow:hidden;}
+  .config-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:20px 24px 16px;border-bottom:1px solid var(--border);}
+  .config-head h2{margin:0 0 4px;}
+  .config-head .sub{margin:0;}
+  .config-close{width:30px;height:30px;border-radius:50%;color:var(--text-2);font-size:18px;display:flex;align-items:center;justify-content:center;flex:0 0 auto;}
+  .config-close:hover{background:var(--surface-3);color:var(--text);}
+  .config-body{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(270px,.9fr);gap:18px;padding:20px 24px;overflow-y:auto;overscroll-behavior:contain;}
+  .config-column{min-width:0;display:flex;flex-direction:column;gap:16px;}
+  .config-section{border:1px solid var(--border);border-radius:var(--radius-l);background:var(--surface-2);padding:16px;}
+  .config-section-head{margin-bottom:12px;}
+  .config-section-head h3{margin:0 0 3px;font-size:13px;font-weight:650;color:var(--text);}
+  .config-section-head p{margin:0;color:var(--text-3);font-size:11px;line-height:1.45;}
+  .path-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;}
+  .config-modal .field{margin:0 0 12px;}
+  .config-modal .field:last-child{margin-bottom:0;}
+  .config-modal .actions{margin:0;padding:14px 24px;position:sticky;bottom:0;background:var(--surface);}
+  .config-two{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .config-side .field:last-child{margin-bottom:0;}
+  .rknn-box{padding-top:14px;margin-top:14px;border-top:1px solid var(--border);}
+  @media(max-width:760px){
+    .config-body{grid-template-columns:1fr;padding:16px;}
+    .config-head{padding:16px;}
+    .config-two{grid-template-columns:1fr;}
+    .config-modal .actions{padding:12px 16px;}
+  }
   @keyframes maskIn{from{opacity:0}to{opacity:1}}
   @keyframes maskOut{from{opacity:1}to{opacity:0}}
   @keyframes modalIn{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
@@ -2425,8 +2240,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="spacer"></div>
   <button class="tbtn primary" id="btnPredict" onclick="predict()" disabled>模型预测</button>
   <button class="tbtn" id="btnAuto" onclick="openAuto()" disabled>自动化标注</button>
-  <button class="tbtn" id="btnVlmAuto" onclick="openVlmAuto()" disabled>多模态标注</button>
-  <button class="tbtn" id="btnVlmReview" onclick="openVlmReview()" disabled>多模态复核</button>
   <div class="tsep"></div>
   <button class="tbtn" id="btnClear" onclick="clearBoxes()" disabled>清空</button>
   <button class="tbtn primary" id="btnSave" onclick="saveLabels()" disabled>保存</button>
@@ -2465,69 +2278,88 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
 <!-- 配置弹窗 -->
 <div id="modalMask">
-  <div class="modal">
-    <h2>配置</h2>
-    <div class="sub">设置图片目录、类别，以及可选的辅助标注模型</div>
-
-    <div class="grp">
-      <div class="gt">① 数据</div>
-      <div class="field">
-        <label>图片文件夹路径</label>
-        <div style="display:flex;gap:6px;">
-          <input id="imgDir" type="text" placeholder="如 F:\data\images\train">
-          <button class="tbtn" type="button" onclick="pickImgDir()" style="flex-shrink:0;">选择</button>
-        </div>
+  <div class="modal config-modal">
+    <div class="config-head">
+      <div>
+        <h2>配置</h2>
+        <div class="sub">数据目录、类别与辅助模型</div>
       </div>
-      <div class="field">
-        <label>标签文件夹路径 (留空 = 与图片同目录)</label>
-        <div style="display:flex;gap:6px;">
-          <input id="labelDir" type="text" placeholder="如 F:\data\labels\train">
-          <button class="tbtn" type="button" onclick="pickLabelDir()" style="flex-shrink:0;">选择</button>
-        </div>
-      </div>
-      <div class="field">
-        <label>类别 (英文，逗号分隔，顺序即为类别ID)</label>
-        <input id="classesIn" type="text" placeholder="如 acetylene_cylinder,oxygen_cylinder">
-        <div class="hint">第1个=0, 第2个=1 ... 建议用英文，避免训练时中文路径问题</div>
-      </div>
+      <button class="config-close" type="button" onclick="closeModal()" aria-label="关闭配置">×</button>
     </div>
+    <div class="config-body">
+      <div class="config-column">
+        <section class="config-section">
+          <div class="config-section-head">
+            <h3>数据</h3>
+            <p>图片与标签按同名文件配对，标签留空时使用图片目录。</p>
+          </div>
+          <div class="field">
+            <label for="imgDir">图片文件夹</label>
+            <div class="path-row">
+              <input id="imgDir" type="text" placeholder="选择图片目录">
+              <button class="tbtn" type="button" onclick="pickImgDir()">选择</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="labelDir">标签文件夹</label>
+            <div class="path-row">
+              <input id="labelDir" type="text" placeholder="留空则与图片同目录">
+              <button class="tbtn" type="button" onclick="pickLabelDir()">选择</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="classesIn">类别</label>
+            <input id="classesIn" type="text" placeholder="phone,head,hand">
+            <div class="hint">英文逗号分隔，顺序对应类别 ID 0、1、2…</div>
+          </div>
+        </section>
 
-    <div class="grp">
-      <div class="gt">② 模型辅助标注 (可加载多个，预测时合并)</div>
-      <div id="modelCards"></div>
-      <button class="tbtn" style="margin-top:8px" onclick="addModelCard()">+ 添加模型</button>
-      <div class="inline">
-        <div class="field">
-          <label>全局去重 IoU 阈值</label>
-          <input id="iouThr" type="number" step="0.05" min="0" max="1" value="0.5">
-        </div>
-        <div class="field">
-          <label>推理设备</label>
-          <select id="devSel" onchange="saveDevice()">
-            <option value="auto">自动（有显卡就用显卡）</option>
-            <option value="cuda">显卡（最快）</option>
-            <option value="cpu">CPU（把显卡让给训练）</option>
-          </select>
-        </div>
+        <section class="config-section">
+          <div class="config-section-head">
+            <h3>本地模型</h3>
+            <p>可加载多个模型，预测和批量标注时合并结果。</p>
+          </div>
+          <div id="modelCards"></div>
+          <button class="tbtn" type="button" onclick="addModelCard()">+ 添加本地模型</button>
+        </section>
       </div>
-      <div class="hint" id="devHint" style="margin-top:6px"></div>
-      <div class="inline">
-        <div class="field" style="flex:2">
-          <label>RKNN 推理服务地址</label>
-          <input id="rknnUrl" type="text" placeholder="http://127.0.0.1:8077" onchange="saveRknnUrl()">
-        </div>
-      </div>
-      <div class="hint">模型路径支持 <b>rknn://模型代码</b>；两级级联写 <b>rknn://yqzk_smoke?person=person_infra</b>。.rknn 只能在 RK3588 的 NPU 上执行，本机经 SSH 隧道访问该地址。</div>
 
-      <div class="grp" style="margin-top:12px">
-        <div class="gt">RKNN 模型（加入上方模型列表）</div>
-        <div class="hint" style="margin:0 0 8px">选择后只加载模型并返回标注界面；当前图用“模型预测”，整批用“自动化标注”。</div>
-        <div class="inline">
-          <div class="field" style="flex:2">
+      <div class="config-column config-side">
+        <section class="config-section">
+          <div class="config-section-head">
+            <h3>推理设置</h3>
+          </div>
+          <div class="config-two">
+            <div class="field">
+              <label for="iouThr">去重 IoU</label>
+              <input id="iouThr" type="number" step="0.05" min="0" max="1" value="0.5">
+            </div>
+            <div class="field">
+              <label for="devSel">推理设备</label>
+              <select id="devSel" onchange="saveDevice()">
+                <option value="auto">自动</option>
+                <option value="cuda">显卡</option>
+                <option value="cpu">CPU</option>
+              </select>
+            </div>
+          </div>
+          <div class="hint" id="devHint"></div>
+        </section>
+
+        <section class="config-section">
+          <div class="config-section-head">
+            <h3>RKNN 模型</h3>
+            <p>通过本机隧道连接 RK3588 推理服务。</p>
+          </div>
+          <div class="field">
+            <label for="rknnUrl">服务地址</label>
+            <input id="rknnUrl" type="text" placeholder="http://127.0.0.1:8077" onchange="saveRknnUrl()">
+          </div>
+          <div class="field">
             <label for="rknnModelSearch">模型 <span id="rknnStatus" style="font-weight:400"></span></label>
             <div class="model-picker" id="rknnModelPicker">
               <input id="rknnModelSearch" type="text" autocomplete="off"
-                     placeholder="搜索模型名称、代码或类别"
+                     placeholder="搜索名称、代码或类别"
                      role="combobox" aria-autocomplete="list" aria-expanded="false"
                      aria-controls="rknnModelOptions"
                      onfocus="openRknnModelPicker(true)"
@@ -2538,52 +2370,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
               <input id="rknnModelSel" type="hidden" value="">
             </div>
           </div>
-          <div class="field" style="flex:1">
-            <label>置信度</label>
+          <div class="field">
+            <label for="rknnConf">置信度</label>
             <input id="rknnConf" type="number" step="0.05" min="0" max="1" value="0.1">
           </div>
-        </div>
-        <div class="hint" id="rknnModelHint" style="margin-top:6px"></div>
-        <div class="inline" style="align-items:center">
-          <button class="tbtn primary" id="rknnGoBtn" onclick="loadRknnModelForAnnotating()">加载并返回标注界面</button>
-          <button class="tbtn" onclick="loadRknnModels()">刷新模型</button>
-        </div>
-      </div>
-      <div class="hint">加载模型时会按类别名称自动匹配类别偏移（忽略大小写/下划线）；匹配不上可点卡片里的“自动匹配偏移”。同类别重叠框只保留置信度高的，不同类别（如安全帽 + 反光衣）同时保留。</div>
-    </div>
-
-    <div class="grp">
-      <div class="gt">③ 多模态标注 (OpenAI 兼容接口)</div>
-      <div class="inline">
-        <div class="field" style="flex:2">
-          <label>接口地址</label>
-          <input id="vlmBase" type="text" placeholder="如 https://api.openai.com/v1">
-        </div>
-        <div class="field" style="flex:2">
-          <label>模型名</label>
-          <input id="vlmModel" type="text" placeholder="如 gpt-5-mini / qwen-vl-max">
-        </div>
-      </div>
-      <div class="inline">
-        <div class="field" style="flex:2">
-          <label>API Key <span id="vlmKeyState" style="font-weight:400"></span></label>
-          <input id="vlmKey" type="password" placeholder="sk-...">
-        </div>
-        <div class="field" style="flex:1">
-          <label>并发数</label>
-          <input id="vlmConc" type="number" min="1" max="32" value="4">
-        </div>
-      </div>
-      <div class="inline" style="align-items:center">
-        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
-          <input id="vlmThink" type="checkbox" style="width:auto" checked> 思考模式
-        </label>
-      </div>
-      <div class="inline" style="align-items:center">
-        <button class="tbtn" onclick="saveVlmCfg(true)">保存</button>
+          <div class="hint" id="rknnModelHint"></div>
+          <div class="rknn-box config-two">
+            <button class="tbtn primary" id="rknnGoBtn" onclick="loadRknnModelForAnnotating()">加载并返回标注</button>
+            <button class="tbtn" onclick="loadRknnModels()">刷新模型</button>
+          </div>
+        </section>
       </div>
     </div>
-
     <div class="actions">
       <button class="tbtn" onclick="closeModal()">取消</button>
       <button class="tbtn primary" onclick="openFolder()">打开文件夹</button>
@@ -2659,60 +2457,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- 多模态标注弹窗 -->
-<div id="vlmMask" style="position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:100;">
-  <div class="modal" style="width:540px;">
-    <h2>多模态自动标注</h2>
-    <div class="sub"><b id="vlmNameTag"></b></div>
-    <div class="field">
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-        <input id="vlmSkip" type="checkbox" style="width:auto" checked> 仅标注未标注的图片
-      </label>
-    </div>
-    <div class="field">
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-        <input id="vlmSkipEmpty" type="checkbox" style="width:auto" checked> 空结果不写标签（留待复查）
-      </label>
-    </div>
-    <div class="field">
-      <label>去重 IoU 阈值</label>
-      <input id="vlmIou" type="number" step="0.05" min="0" max="1" value="0.5">
-    </div>
-    <div style="background:var(--bg);border-radius:8px;height:16px;overflow:hidden;margin:12px 0;">
-      <div id="vlmBar" style="height:100%;width:0%;background:var(--accent);transition:width .3s;"></div>
-    </div>
-    <div id="vlmMsg" style="font-size:12px;color:var(--text-2);min-height:60px;white-space:pre-wrap;"></div>
-    <div class="actions">
-      <button class="tbtn" id="vlmTestBtn" onclick="testVlm()">用当前图试一张</button>
-      <button class="tbtn" id="vlmCancelBtn" onclick="cancelVlm()" disabled>取消</button>
-      <button class="tbtn primary" id="vlmStartBtn" onclick="startVlm()">开始多模态标注</button>
-    </div>
-  </div>
-</div>
-
-<!-- 多模态复核弹窗 -->
-<div id="revMask" style="position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:100;">
-  <div class="modal" style="width:620px;">
-    <h2>多模态复核</h2>
-    <div class="sub">先出修改建议，确认后再应用；只改类别或删除，不新增框</div>
-    <div class="field">
-      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-        <input id="revDrop" type="checkbox" style="width:auto" checked> 允许删除（模型判定不属于任何类别的框会被删掉）
-      </label>
-    </div>
-    <div style="background:var(--bg);border-radius:8px;height:16px;overflow:hidden;margin:12px 0;">
-      <div id="revBar" style="height:100%;width:0%;background:var(--accent);transition:width .3s;"></div>
-    </div>
-    <div id="revMsg" style="font-size:12px;color:var(--text-2);min-height:70px;white-space:pre-wrap;"></div>
-    <div class="actions">
-      <button class="tbtn" id="revTestBtn" onclick="testVlmReview()">用当前图试一次</button>
-      <button class="tbtn" id="revCancelBtn" onclick="cancelReview()" disabled>取消</button>
-      <button class="tbtn" id="revApplyBtn" onclick="applyVlmReview()" disabled>应用修改</button>
-      <button class="tbtn primary" id="revStartBtn" onclick="startVlmReview()">开始复核</button>
-    </div>
-  </div>
-</div>
-
 <script>
 let idx=0,total=0,imgW=0,imgH=0,scale=1,baseScale=1,offX=0,offY=0;
 let boxes=[],classes=[],curCls=0,selIdx=-1,files=[];
@@ -2722,8 +2466,6 @@ let modelSlots=[];
 let modelKeySeq=1;
 let autoTimer=null;
 let autoActive=false;
-let vlmTimer=null;
-let vlmActive=false;
 let predicting=false;
 const overlayTimers={};
 let dirty=false;
@@ -2831,7 +2573,6 @@ fetch('/api/config').then(r=>r.json()).then(c=>{
   if(c.img_dir)document.getElementById('imgDir').value=c.img_dir;
   if(c.label_dir)document.getElementById('labelDir').value=c.label_dir;
   if(c.classes)document.getElementById('classesIn').value=c.classes;
-  fillVlmFields(c.vlm||{});
   if(c.rknn_url)document.getElementById('rknnUrl').value=c.rknn_url;
   refreshDeviceInfo();
   loadRknnModels();
@@ -2865,7 +2606,7 @@ function restoreLastFolder(c){
     const cf=document.getElementById('curFolder');
     if(cf){cf.textContent=d.img_dir||'';cf.title=d.img_dir||'';}
     ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto',
-     'btnSplit','btnVlmAuto','btnVlmReview'].forEach(id=>{
+     'btnSplit'].forEach(id=>{
       const el=document.getElementById(id);if(el)el.disabled=false;});
     buildClsBtns();buildFileList();load(0);
     st('已恢复上次标注文件夹');
@@ -2880,7 +2621,7 @@ function restoreSession(d){
   files=d.files;total=files.length;idx=0;
   const cf=document.getElementById('curFolder');
   if(cf){cf.textContent=d.img_dir||'';cf.title=d.img_dir||'';}
-  ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto','btnSplit','btnVlmAuto','btnVlmReview']
+  ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto','btnSplit']
     .forEach(id=>{const el=document.getElementById(id);if(el)el.disabled=false;});
   buildClsBtns();buildFileList();load(0);
   const a=d.auto||{};
@@ -2888,21 +2629,12 @@ function restoreSession(d){
 }
 
 function resumeBatch(a){
-  if(a.mode==='vlm'){
-    vlmActive=true;
-    document.getElementById('vlmStartBtn').disabled=true;
-    const cb=document.getElementById('vlmCancelBtn');
-    cb.disabled=false;cb.textContent='取消';cb.onclick=cancelVlm;
-    openOverlay('vlmMask');
-    pollVlm();
-  }else{
-    autoActive=true;
-    document.getElementById('autoStartBtn').disabled=true;
-    const cb=document.getElementById('autoCancelBtn');
-    cb.disabled=false;cb.textContent='取消';cb.onclick=cancelAuto;
-    openOverlay('autoMask');
-    pollAuto();
-  }
+  autoActive=true;
+  document.getElementById('autoStartBtn').disabled=true;
+  const cb=document.getElementById('autoCancelBtn');
+  cb.disabled=false;cb.textContent='取消';cb.onclick=cancelAuto;
+  openOverlay('autoMask');
+  pollAuto();
 }
 
 function refreshDeviceInfo(){
@@ -3111,7 +2843,7 @@ async function loadRknnModelForAnnotating(){
     applyServerModels(models);
     closeModal();
     ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto',
-     'btnSplit','btnVlmAuto','btnVlmReview'].forEach(id=>{
+     'btnSplit'].forEach(id=>{
       const el=document.getElementById(id);if(el)el.disabled=false;});
     buildClsBtns();buildFileList();load(0);
     st(existing?'RKNN 模型已在列表中，可以直接预测'
@@ -3120,63 +2852,23 @@ async function loadRknnModelForAnnotating(){
   finally{btn.disabled=false;btn.textContent='加载并返回标注界面';}
 }
 
-function fillVlmFields(v){
-  if(v.model)document.getElementById('vlmModel').value=v.model;
-  if(v.base_url)document.getElementById('vlmBase').value=v.base_url;
-  if(v.concurrency)document.getElementById('vlmConc').value=v.concurrency;
-  if(v.thinking!==undefined)document.getElementById('vlmThink').checked=!!v.thinking;
-  const st=document.getElementById('vlmKeyState');
-  const inp=document.getElementById('vlmKey');
-  if(v.has_key){
-    st.textContent='(已保存)';
-    inp.placeholder='•••••••• 已保存';
-  }else{
-    st.textContent='';
-    inp.placeholder='sk-...';
-  }
-}
-
-function saveVlmCfg(loud){
-  const body={
-    model:document.getElementById('vlmModel').value.trim(),
-    base_url:document.getElementById('vlmBase').value.trim(),
-    concurrency:parseInt(document.getElementById('vlmConc').value)||4,
-    thinking:document.getElementById('vlmThink').checked,
-  };
-  const keyEl=document.getElementById('vlmKey');
-  if(keyEl.value.trim())body.api_key=keyEl.value.trim();
-  return fetch('/api/vlm_config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify(body)}).then(r=>r.json()).then(d=>{
-    if(d.ok){
-      fillVlmFields(d.vlm);
-      keyEl.value='';
-      if(loud)st('已保存');
-    }else if(loud){
-      st('保存失败');
-    }
-    return d;
-  });
-}
-
 function openFolder(){
   const img_dir=document.getElementById('imgDir').value;
   const label_dir=document.getElementById('labelDir').value;
   classes=document.getElementById('classesIn').value.split(',').map(s=>s.trim()).filter(s=>s);
   if(!classes.length){alert('请至少填写一个类别');return;}
-  const keyEl=document.getElementById('vlmKey');
-  const p=keyEl.value.trim()?saveVlmCfg(false):Promise.resolve();
-  p.then(()=>fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},
+  fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({img_dir,label_dir,classes})}).then(r=>r.json()).then(d=>{
     if(!d.ok){alert(d.msg);return;}
     total=d.count;idx=0;files=d.files;
-    // 服务端会把「类别名(提示)」里的提示剥掉，这里用回干净的类别名
     if(d.classes&&d.classes.length)classes=d.classes.slice();
     const cf=document.getElementById('curFolder');
     if(cf){cf.textContent=d.img_dir||'';cf.title=d.img_dir||'';}
     closeModal();
-    ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto','btnSplit','btnVlmAuto'].forEach(id=>document.getElementById(id).disabled=false);
+    ['btnPrev','btnNext','btnSave','btnClear','btnPredict','btnAuto','btnSplit']
+      .forEach(id=>document.getElementById(id).disabled=false);
     buildClsBtns();buildFileList();load(0);
-  }));
+  });
 }
 
 function newModelSlot(){
@@ -3770,204 +3462,6 @@ function refreshAfterAuto(){
   load(idx);
 }
 
-// ---------- 多模态标注 ----------
-let vlmTestSec=0;
-function openVlmAuto(){
-  if(!classes.length){alert('请先打开文件夹并填写类别');return;}
-  const m=document.getElementById('vlmModel').value.trim();
-  const b=document.getElementById('vlmBase').value.trim();
-  if(!m||!b){alert('请先在配置里填写接口地址和模型名');return;}
-  document.getElementById('vlmNameTag').textContent=m;
-  document.getElementById('vlmIou').value=document.getElementById('iouThr').value;
-  document.getElementById('vlmBar').style.width='0%';
-  document.getElementById('vlmMsg').textContent='';
-  document.getElementById('vlmStartBtn').disabled=false;
-  const cb=document.getElementById('vlmCancelBtn');
-  cb.disabled=false;cb.textContent='取消';cb.onclick=cancelVlm;
-  vlmActive=true;
-  openOverlay('vlmMask');
-}
-
-function testVlm(){
-  saveVlmCfg(false).then(()=>{
-    const btn=document.getElementById('vlmTestBtn');
-    btn.disabled=true;
-    document.getElementById('vlmMsg').textContent='试标中...';
-    const iou=parseFloat(document.getElementById('vlmIou').value)||0.5;
-    const t0=Date.now();
-    fetch('/api/vlm_test',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({idx,iou})}).then(r=>r.json()).then(d=>{
-      btn.disabled=false;
-      if(!d.ok){document.getElementById('vlmMsg').textContent='试标失败: '+(d.msg||'');return;}
-      vlmTestSec=(Date.now()-t0)/1000;
-      const s0=(d.stats||[])[0]||{};
-      const valid=d.boxes.filter(b=>b&&isFinite(b.cx)&&isFinite(b.cy)&&b.w>0&&b.h>0);
-      const added=dedupeAppend(valid,iou);
-      if(added.length){snap();boxes.push(...added);markDirty();redraw();}
-      let m='试标: '+(s0.raw||0)+'→'+(s0.kept||0)+'，新增 '+added.length+
-            '，'+vlmTestSec.toFixed(1)+'s';
-      if(s0.note)m+='\n'+s0.note;
-      document.getElementById('vlmMsg').textContent=m;
-    }).catch(()=>{
-      btn.disabled=false;
-      document.getElementById('vlmMsg').textContent='试标失败: 请求异常';
-    });
-  });
-}
-function startVlm(){
-  saveLabels(true);
-  saveVlmCfg(false).then(()=>{
-    const skip=document.getElementById('vlmSkip').checked;
-    const skipEmpty=document.getElementById('vlmSkipEmpty').checked;
-    const iou=parseFloat(document.getElementById('vlmIou').value)||0.5;
-    const btn=document.getElementById('vlmStartBtn');
-    btn.disabled=true;
-    document.getElementById('vlmCancelBtn').disabled=false;
-    document.getElementById('vlmMsg').textContent='准备中...';
-    fetch('/api/auto_annotate',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({skip_labeled:skip,skip_empty:skipEmpty,iou,vlm:true})
-    }).then(r=>r.json()).then(d=>{
-      if(!d.ok){document.getElementById('vlmMsg').textContent=d.msg||'启动失败';
-        btn.disabled=false;document.getElementById('vlmCancelBtn').disabled=true;return;}
-      pollVlm();
-    });
-  });
-}
-function pollVlm(){
-  if(!vlmActive)return;
-  fetch('/api/auto_annotate_status').then(r=>r.json()).then(d=>{
-    document.getElementById('vlmBar').style.width=(d.percent||0)+'%';
-    const errs=d.errors||[];
-    let msg='进度: '+d.done+' / '+d.total+' ('+(d.percent||0)+'%)\n'+
-            '当前: '+(d.current||'')+'\n'+
-            '已标注: '+d.saved+'　跳过: '+d.skipped+
-            (d.empty?('　空结果未写(待复查): '+d.empty):'')+
-            (d.failed?('　失败: '+d.failed):'');
-    if(errs.length)msg+='\n错误 '+errs.length+' 个: '+errs.slice(0,3).join(' | ');
-    document.getElementById('vlmMsg').textContent=msg;
-    if(d.running){
-      vlmTimer=setTimeout(pollVlm,900);
-    }else{
-      document.getElementById('vlmStartBtn').disabled=false;
-      if(d.finished){
-        const cb=document.getElementById('vlmCancelBtn');
-        cb.disabled=false;cb.textContent='关闭';cb.onclick=()=>{closeOverlay('vlmMask');vlmActive=false;};
-        st('多模态标注完成: 标注 '+d.saved+' 张'
-           +(d.empty?('，空结果未写 '+d.empty+' 张'):'')
-           +(d.failed?('，失败 '+d.failed+' 张'):'')+'，请逐张复核');
-        refreshAfterAuto();
-      }
-    }
-  });
-}
-function cancelVlm(){
-  fetch('/api/auto_cancel',{method:'POST'});
-  vlmActive=false;
-  clearTimeout(vlmTimer);
-  closeOverlay('vlmMask');
-}
-
-// ---------- 多模态复核 ----------
-let revTimer=null, revActive=false;
-function openVlmReview(){
-  if(!classes.length){alert('请先打开文件夹并填写类别');return;}
-  const m=document.getElementById('vlmModel').value.trim();
-  const b=document.getElementById('vlmBase').value.trim();
-  if(!m||!b){alert('请先在配置里填写接口地址和模型名');return;}
-  document.getElementById('revBar').style.width='0%';
-  document.getElementById('revMsg').textContent='';
-  document.getElementById('revStartBtn').disabled=false;
-  document.getElementById('revApplyBtn').disabled=true;
-  const cb=document.getElementById('revCancelBtn');
-  cb.disabled=false;cb.textContent='取消';cb.onclick=cancelReview;
-  revActive=true;
-  openOverlay('revMask');
-}
-function fmtChanges(cs){
-  return (cs||[]).map(c=>c.action==='drop'
-      ? ('  删除 '+c.from)
-      : ('  '+c.from+' → '+c.to)).join('\n');
-}
-function testVlmReview(){
-  saveVlmCfg(false).then(()=>{
-    const btn=document.getElementById('revTestBtn');
-    btn.disabled=true;
-    document.getElementById('revMsg').textContent='复核当前图...';
-    fetch('/api/vlm_review_test',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({idx,drop_allowed:document.getElementById('revDrop').checked})
-    }).then(r=>r.json()).then(d=>{
-      btn.disabled=false;
-      if(!d.ok){document.getElementById('revMsg').textContent='失败: '+(d.msg||'');return;}
-      let s='本图 '+d.total+' 个框，复核后保留 '+d.kept+' 个';
-      if(!d.changes.length)s+='，无改动';
-      if(d.unparsed)s+='（'+d.unparsed+' 个未给结论，已保持原样）';
-      document.getElementById('revMsg').textContent=s+'\n'+fmtChanges(d.changes);
-    }).catch(()=>{btn.disabled=false;
-      document.getElementById('revMsg').textContent='失败: 请求异常';});
-  });
-}
-function startVlmReview(){
-  saveLabels(true);
-  saveVlmCfg(false).then(()=>{
-    const btn=document.getElementById('revStartBtn');
-    btn.disabled=true;
-    document.getElementById('revCancelBtn').disabled=false;
-    document.getElementById('revMsg').textContent='准备中...';
-    fetch('/api/vlm_review',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({drop_allowed:document.getElementById('revDrop').checked,
-                           dry_run:true})
-    }).then(r=>r.json()).then(d=>{
-      if(!d.ok){document.getElementById('revMsg').textContent=d.msg||'启动失败';
-        btn.disabled=false;
-        document.getElementById('revCancelBtn').disabled=true;return;}
-      pollReview();
-    });
-  });
-}
-function pollReview(){
-  if(!revActive)return;
-  fetch('/api/auto_annotate_status').then(r=>r.json()).then(d=>{
-    document.getElementById('revBar').style.width=(d.percent||0)+'%';
-    let msg=d.done+' / '+d.total+' ('+(d.percent||0)+'%)　'+(d.current||'')+
-            '\n改类 '+(d.reclassed||0)+'　删除 '+(d.dropped||0)+
-            '　无改动 '+(d.unchanged||0)+(d.skipped?('　跳过 '+d.skipped):'')+
-            (d.failed?('　失败 '+d.failed):'');
-    const cs=d.changes||[];
-    if(cs.length)msg+='\n最近改动:\n'+fmtChanges(cs.slice(-8));
-    const errs=d.errors||[];
-    if(errs.length)msg+='\n'+errs.slice(0,2).join(' | ');
-    document.getElementById('revMsg').textContent=msg;
-    if(d.running){
-      revTimer=setTimeout(pollReview,900);
-    }else{
-      document.getElementById('revStartBtn').disabled=false;
-      if(d.finished){
-        if(d.changed)document.getElementById('revApplyBtn').disabled=false;
-        const cb=document.getElementById('revCancelBtn');
-        cb.disabled=false;cb.textContent='关闭';
-        cb.onclick=()=>{closeOverlay('revMask');revActive=false;};
-        st('复核完成: 建议改类 '+(d.reclassed||0)+'，建议删除 '+(d.dropped||0)+
-           '，未改动 '+(d.unchanged||0)+'（尚未写盘）');
-      }
-    }
-  });
-}
-function applyVlmReview(){
-  const btn=document.getElementById('revApplyBtn');
-  btn.disabled=true;
-  fetch('/api/vlm_review_apply',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(!d.ok){alert(d.msg||'应用失败');return;}
-    st('已应用修改: '+d.applied+' 张');
-    refreshAfterAuto();
-  });
-}
-function cancelReview(){
-  fetch('/api/auto_cancel',{method:'POST'});
-  revActive=false;
-  clearTimeout(revTimer);
-  closeOverlay('revMask');
-}
-
 document.addEventListener('keydown',e=>{
   if(document.getElementById('modalMask').style.display==='flex')return;
   if(document.getElementById('splitMask').style.display==='flex')return;
@@ -4001,6 +3495,7 @@ def open_browser():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     print("=" * 52)
     print("  YOLO 标注工具启动中...")
     print("=" * 52)
