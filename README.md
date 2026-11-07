@@ -2,6 +2,9 @@
 
 一个运行在本机的 YOLO 检测图片标注工具：Flask 后端 + WebView2 桌面窗口，深色中文界面。支持手动标注、模型辅助标注、类别过滤、预测去重、数据集自动划分与图片去重，适合个人和小团队快速完成标注并进入训练循环。
 
+接续开发、架构说明、已知风险和下一阶段任务见
+[docs/AI_HANDOFF.md](docs/AI_HANDOFF.md)。
+
 ## 特色功能
 
 ### 手动标注
@@ -162,13 +165,13 @@ build_exe.bat
 ```text
 dist\云企智瞰标注工具\
 ├── 云企智瞰标注工具.exe
-├── _internal\
-└── annotate_config.json  # 首次运行后生成
+└── _internal\
 ```
 
 采用 `onedir` 而不是单文件，原因是本地 YOLO 依赖 PyTorch/CUDA，单文件每次启动都要
 解压大量 DLL，速度慢且更容易被杀毒软件拦截。发布时请分发整个
-`dist\云企智瞰标注工具` 文件夹。
+`dist\云企智瞰标注工具` 文件夹。安装版配置保存在
+`%LOCALAPPDATA%\YunqiZhikanAnnotator`，不会写进安装目录。
 
 如需生成安装程序，先完成 EXE 构建，再运行 `build_installer.bat`。安装包输出到
 `installer\output`。
